@@ -1,0 +1,19 @@
+#!/bin/bash
+# Launch OHealth. Quickshell runs the QML next to this checkout.
+set -euo pipefail
+source="$(readlink -f "$0")"
+dir="$(cd "$(dirname "$source")/.." && pwd)"
+
+if [[ "${1:-}" == "--sample" ]]; then
+  export OHEALTH_SAMPLE=1
+  shift
+fi
+
+if ! command -v quickshell >/dev/null 2>&1; then
+  echo "quickshell is not on PATH." >&2
+  echo "On Omarchy: sudo pacman -S quickshell" >&2
+  echo "Then: $dir/bin/ohealth" >&2
+  exit 127
+fi
+
+exec quickshell -p "$dir/ui/shell.qml" "$@"

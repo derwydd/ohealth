@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-read the OHealth inbox every 30 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

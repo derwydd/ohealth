@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OHealth
+GenericName=Health
+Comment=Activity, vitals, and trends from an Apple Health export
+Exec=ohealth
+Terminal=false
+Categories=Utility;Science;
+StartupNotify=true

@@ -1,0 +1,8 @@
+[Unit]
+Description=Index an Apple Health export for OHealth
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ohealth-sync
+UMask=0077
+Nice=10
