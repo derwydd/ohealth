@@ -11,7 +11,10 @@ Item {
   property int dayIndex: 0
   property string zone: "metrics"
   property int rangeIndex: 1
-  property var rangeLabels: ["7 days", "30 days", "90 days", "1 year"]
+  property bool customActive: false
+  property int dragAnchor: -1
+  property int dragEnd: -1
+  property var rangeLabels: ["7 days", "30 days", "90 days", "1 year", "3 years", "5 years", "All"]
   property string state: "loading"
   property string stateMessage: ""
   property string errorMessage: ""
@@ -25,6 +28,7 @@ Item {
   property string focusId: ""
 
   signal rangeChosen(int index)
+  signal customRangeChosen(string start, string end)
   signal metricChosen(int index)
   signal dayChosen(int index)
   signal zoneChosen(string name)
@@ -38,18 +42,6 @@ Item {
   readonly property var metric: (metricIndex >= 0 && metricIndex < metrics.length) ? metrics[metricIndex] : null
   readonly property var series: (metric && metric.series) ? metric.series : []
 
-  function hasActivity() {
-    for (var i = 0; i < metrics.length; i++)
-      if (metrics[i].group === "activity") return true
-    return false
-  }
-
-  function activityEnds(index) {
-    if (index < 0 || index >= metrics.length) return false
-    if (metrics[index].group !== "activity") return false
-    return index === metrics.length - 1 || metrics[index + 1].group !== "activity"
-  }
-
   function dayName(iso) {
     if (!iso) return ""
     var p = String(iso).split("-")
@@ -60,17 +52,25 @@ Item {
     return names[dt.getDay()] + " " + dt.getDate() + " " + months[dt.getMonth()]
   }
 
-  function ensureDayVisible() {
-    if (series.length === 0) return
-    var w = Math.max(4, chartRow.barWidth)
-    var x = dayIndex * w
-    var viewRight = chartFlick.contentX + chartFlick.width
-    if (x < chartFlick.contentX) chartFlick.contentX = x
-    else if (x + w > viewRight) chartFlick.contentX = Math.max(0, x + w - chartFlick.width)
+  function rangeSpan() {
+    if (!view) return ""
+    var start = view.start || (days.length ? days[0] : "")
+    var end = view.end || (days.length ? days[days.length - 1] : "")
+    if (!start || !end) return view.label || ""
+    return (view.label || "") + "  ·  " + dayName(start) + " – " + dayName(end)
   }
 
-  onDayIndexChanged: ensureDayVisible()
-  onMetricIndexChanged: ensureDayVisible()
+  function dayAt(x, width) {
+    var n = series.length
+    if (n === 0 || width <= 0) return -1
+    var index = Math.floor(x / (width / n))
+    return Math.max(0, Math.min(n - 1, index))
+  }
+
+  onViewChanged: {
+    dragAnchor = -1
+    dragEnd = -1
+  }
 
   Column {
     id: top
@@ -90,17 +90,17 @@ Item {
           width: chip.implicitWidth + 22
           height: 28
           radius: 6
-          color: index === root.rangeIndex ? theme.selection : theme.darkBackground
-          border.width: root.zone === "ranges" && index === root.rangeIndex ? 2 : 1
-          border.color: index === root.rangeIndex ? theme.accent : theme.lighterBackground
+          color: !root.customActive && index === root.rangeIndex ? theme.selection : theme.darkBackground
+          border.width: root.zone === "ranges" && !root.customActive && index === root.rangeIndex ? 2 : 1
+          border.color: !root.customActive && index === root.rangeIndex ? theme.accent : theme.lighterBackground
           Text {
             id: chip
             anchors.centerIn: parent
             text: modelData
-            color: index === root.rangeIndex ? theme.brightForeground : theme.foreground
+            color: !root.customActive && index === root.rangeIndex ? theme.brightForeground : theme.foreground
             font.family: theme.fontFamily
             font.pixelSize: theme.fontSize
-            font.bold: index === root.rangeIndex
+            font.bold: !root.customActive && index === root.rangeIndex
           }
           MouseArea {
             anchors.fill: parent
@@ -110,6 +110,24 @@ Item {
               root.rangeChosen(index)
             }
           }
+        }
+      }
+      Rectangle {
+        visible: root.customActive
+        width: customChip.implicitWidth + 22
+        height: 28
+        radius: 6
+        color: theme.selection
+        border.width: 2
+        border.color: theme.accent
+        Text {
+          id: customChip
+          anchors.centerIn: parent
+          text: "Custom"
+          color: theme.brightForeground
+          font.family: theme.fontFamily
+          font.pixelSize: theme.fontSize
+          font.bold: true
         }
       }
     }
@@ -239,8 +257,12 @@ Item {
       border.color: root.zone === "metrics" ? theme.accent : theme.lighterBackground
 
       Flickable {
-        anchors.fill: parent
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: documents.top
         anchors.margins: 8
+        anchors.bottomMargin: 0
         contentHeight: metricCol.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
@@ -249,10 +271,6 @@ Item {
           id: metricCol
           width: parent.width
           spacing: 2
-
-          DocumentSection {
-            visible: !root.hasActivity()
-          }
 
           Repeater {
             model: root.metrics
@@ -314,13 +332,19 @@ Item {
                   }
                 }
               }
-
-              DocumentSection {
-                visible: root.activityEnds(index)
-              }
             }
           }
         }
+      }
+
+      DocumentSection {
+        id: documents
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: 8
+        anchors.rightMargin: 8
+        anchors.bottomMargin: 8
       }
     }
 
@@ -363,6 +387,16 @@ Item {
           elide: Text.ElideRight
         }
 
+        Text {
+          width: parent.width
+          elide: Text.ElideRight
+          visible: root.rangeSpan().length > 0
+          text: root.rangeSpan()
+          color: theme.accent
+          font.family: theme.fontFamily
+          font.pixelSize: theme.fontSize - 1
+        }
+
         Row {
           width: parent.width
           spacing: 16
@@ -402,58 +436,90 @@ Item {
         anchors.topMargin: 8
         visible: root.gallery === "" && root.state === "ready" && root.series.length > 0
 
-          Flickable {
-            id: chartFlick
+        Canvas {
+          id: chartCanvas
+          anchors.fill: parent
+          property var plotted: root.series
+          property int focusDay: root.dayIndex
+          property int dragLo: root.dragAnchor
+          property int dragHi: root.dragEnd
+          property real peak: root.metric && root.metric.seriesMax ? root.metric.seriesMax : 0
+          onPlottedChanged: requestPaint()
+          onFocusDayChanged: requestPaint()
+          onDragLoChanged: requestPaint()
+          onDragHiChanged: requestPaint()
+          onPeakChanged: requestPaint()
+          onWidthChanged: requestPaint()
+          onHeightChanged: requestPaint()
+          onPaint: {
+            var ctx = getContext("2d")
+            ctx.clearRect(0, 0, width, height)
+            var series = plotted
+            var n = series ? series.length : 0
+            if (n === 0 || width <= 0 || height <= 0) return
+            var slot = width / n
+            var barW = Math.max(1, slot > 2 ? slot - 1 : slot)
+            var maxV = peak
+            var lo = dragLo
+            var hi = dragHi
+            if (lo > hi) { var swap = lo; lo = hi; hi = swap }
+            var dragging = lo >= 0 && hi >= 0 && lo !== hi
+            if (dragging) {
+              ctx.fillStyle = theme.selection
+              ctx.fillRect(lo * slot, 0, (hi - lo + 1) * slot, height)
+            } else if (focusDay >= 0 && focusDay < n) {
+              ctx.fillStyle = theme.selection
+              ctx.fillRect(focusDay * slot, 0, Math.max(slot, 1), height)
+            }
+            for (var i = 0; i < n; i++) {
+              var value = series[i]
+              if (value === null || value === undefined || maxV <= 0) continue
+              var h = Math.max(1, (Number(value) / maxV) * (height - 4))
+              var marked = dragging ? (i === lo || i === hi) : i === focusDay
+              ctx.fillStyle = marked ? theme.accent : theme.muted
+              ctx.fillRect(i * slot + Math.max(0, (slot - barW) / 2), height - h, barW, h)
+            }
+          }
+          MouseArea {
+            id: chartDrag
             anchors.fill: parent
-            contentWidth: chartRow.width
-            contentHeight: height
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
-            flickableDirection: Flickable.HorizontalFlick
-
-            Row {
-              id: chartRow
-              height: chartFlick.height
-              spacing: 0
-              property real barWidth: {
-                var n = Math.max(1, root.series.length)
-                return Math.max(4, (chartBox.width - 2) / n)
+            hoverEnabled: true
+            preventStealing: true
+            cursorShape: Qt.SizeHorCursor
+            property int pressIndex: -1
+            onPressed: mouse => {
+              pressIndex = root.dayAt(mouse.x, width)
+              root.dragAnchor = pressIndex
+              root.dragEnd = pressIndex
+            }
+            onPositionChanged: mouse => {
+              if (pressIndex < 0) return
+              root.dragEnd = root.dayAt(mouse.x, width)
+            }
+            onReleased: mouse => {
+              var end = root.dayAt(mouse.x, width)
+              var start = pressIndex
+              pressIndex = -1
+              if (start < 0 || end < 0) return
+              if (start === end) {
+                root.dragAnchor = -1
+                root.dragEnd = -1
+                root.zoneChosen("days")
+                root.dayChosen(start)
+                return
               }
-
-              Repeater {
-                model: root.series
-                delegate: Item {
-                  required property var modelData
-                  required property int index
-                  width: chartRow.barWidth
-                  height: chartRow.height
-                  Rectangle {
-                    anchors.fill: parent
-                    color: index === root.dayIndex ? theme.selection : "transparent"
-                  }
-                  Rectangle {
-                    anchors.bottom: parent.bottom
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    width: Math.max(1, parent.width - 1)
-                    height: {
-                      var maxV = root.metric && root.metric.seriesMax ? root.metric.seriesMax : 0
-                      if (modelData === null || modelData === undefined || maxV <= 0) return 0
-                      return Math.max(2, (Number(modelData) / maxV) * (parent.height - 4))
-                    }
-                    color: index === root.dayIndex ? theme.accent : theme.muted
-                  }
-                  MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                      root.zoneChosen("days")
-                      root.dayChosen(index)
-                    }
-                  }
-                }
-              }
+              var lo = Math.min(start, end)
+              var hi = Math.max(start, end)
+              root.customRangeChosen(root.days[lo], root.days[hi])
+            }
+            onCanceled: {
+              pressIndex = -1
+              root.dragAnchor = -1
+              root.dragEnd = -1
             }
           }
         }
+      }
 
       Column {
         id: chartFoot
@@ -531,7 +597,6 @@ Item {
   }
 
   component DocumentSection: Column {
-    width: metricCol.width
     spacing: 2
 
     Text {

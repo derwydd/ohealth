@@ -83,6 +83,10 @@ def test_sample_is_labeled_and_ranged(tmp: Path) -> None:
     assert steps["series"][-1] < steps["series"][0] or min(steps["series"]) < 6000
     year = index["ranges"]["365d"]
     assert len(year["days"]) == 365
+    assert len(index["ranges"]["3y"]["days"]) == 400
+    assert len(index["ranges"]["5y"]["days"]) == 400
+    assert len(index["ranges"]["all"]["days"]) == 400
+    assert index["ranges"]["all"]["label"] == "All"
     hrv = next(item for item in year["metrics"] if item["id"] == "hrv")
     assert any(value is None for value in hrv["series"])
     summary_ids = [tile["id"] for tile in window["summary"]]
@@ -605,6 +609,37 @@ def test_agent_picker_writes_omarchy_file(tmp: Path) -> None:
     assert "pid" not in payload
 
 
+def test_custom_range_is_saved_for_the_person(tmp: Path) -> None:
+    env = isolate(tmp)
+    alex = enter_person(env, "Alex")
+    assert run(env, "ohealth_sync.py", ["--sample", "--sample-end", "2026-09-25"]).returncode == 0
+    saved = run(env, "ohealth_sync.py", ["--range", "custom", "--range-start", "2026-09-20", "--range-end", "2026-09-10"])
+    assert saved.returncode == 0, saved.stderr
+    index = load_index(env)
+    assert index["range"] == {"id": "custom", "start": "2026-09-10", "end": "2026-09-20"}
+    window = index["ranges"]["custom"]
+    assert window["days"][0] == "2026-09-10"
+    assert window["days"][-1] == "2026-09-20"
+    assert len(window["days"]) == 11
+    steps = next(item for item in window["metrics"] if item["id"] == "steps")
+    assert len(steps["series"]) == 11
+    again = run(env, "ohealth_sync.py", [])
+    assert again.returncode == 0, again.stderr
+    assert load_index(env)["range"]["id"] == "custom"
+    preset = run(env, "ohealth_sync.py", ["--range", "7d"])
+    assert preset.returncode == 0, preset.stderr
+    narrowed = load_index(env)
+    assert narrowed["range"]["id"] == "7d"
+    assert "custom" not in narrowed["ranges"]
+    assert len(narrowed["ranges"]["7d"]["days"]) == 7
+    blake = enter_person(env, "Blake")
+    assert blake != alex
+    assert load_index(env)["range"]["id"] == "30d"
+    restored = run(env, "ohealth_sync.py", ["--user", alex])
+    assert restored.returncode == 0, restored.stderr
+    assert load_index(env)["range"]["id"] == "7d"
+
+
 def main() -> None:
     import tempfile
     tests = [
@@ -620,6 +655,7 @@ def main() -> None:
         test_people_keep_separate_records,
         test_existing_rows_become_a_person,
         test_import_requires_a_person,
+        test_custom_range_is_saved_for_the_person,
         test_missing_export_is_an_error,
         test_agent_picker_writes_omarchy_file,
     ]

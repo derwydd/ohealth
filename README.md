@@ -69,8 +69,8 @@ Press `?` in the window for the same list.
 
 | Key | Action |
 |---|---|
-| `tab` `shift+tab` | Next region, previous region: ranges, metrics, days, agent |
-| `1` `2` `3` `4` | 7 days, 30 days, 90 days, 1 year |
+| `tab` `shift+tab` | Next region, previous region: ranges, metrics, days, chat, agent |
+| `1` `2` `3` `4` `5` `6` `7` | 7 days, 30 days, 90 days, 1 year, 3 years, 5 years, all |
 | `[` `]` | Shorter range, longer range |
 | `h` `j` `k` `l`, arrows | Move inside the focused region |
 | `g` `home` / `G` `end` | First / last in that region |

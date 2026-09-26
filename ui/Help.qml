@@ -20,7 +20,8 @@ Item {
   readonly property var sections: [
     { title: "Move", keys: [
       ["tab  shift+tab", "next region, previous region"],
-      ["1  2  3  4", "7 days, 30 days, 90 days, 1 year"],
+      ["1  2  3  4  5  6  7", "7 days, 30 days, 90 days, 1 year, 3 years, 5 years, all"],
+      ["drag across a chart", "save that span as this person's date range"],
       ["h  l  ←  →", "change the focused row"],
       ["j  k  ↑  ↓", "change the focused row"],
       ["g  home", "first day or first metric"],
@@ -47,6 +48,7 @@ Item {
       ["ranges", "the four windows across the top"],
       ["metrics", "activity, then vitals"],
       ["days", "the bars of the focused metric"],
+      ["chat", "the question field. Tab lands here so you can type"],
       ["agent", "the Omarchy agent named in the footer"]
     ]}
   ]

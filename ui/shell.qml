@@ -32,8 +32,8 @@ ShellRoot {
   readonly property string agentScript: binDir + "/ohealth-agent"
   readonly property string defaultDatabase: configHome + "/ohealth/ohealth.sqlite"
   readonly property string databasePath: (status && status.database) ? status.database : defaultDatabase
-  readonly property var rangeIds: ["7d", "30d", "90d", "365d"]
-  readonly property var zones: ["ranges", "metrics", "days", "agent"]
+  readonly property var rangeIds: ["7d", "30d", "90d", "365d", "3y", "5y", "all"]
+  readonly property var zones: ["ranges", "metrics", "days", "chat", "agent"]
 
   property bool sampleMode: false
   property bool exportBusy: false
@@ -46,9 +46,11 @@ ShellRoot {
   property var view: ({})
   property var agents: ({})
   property int rangeIndex: 1
+  property bool customActive: false
   property int metricIndex: 0
   property int dayIndex: 0
   property int zoneIndex: 1
+  property int zoneBeforeChat: 1
   property int agentCursor: 0
   property string pendingAgentId: ""
   property bool placedDay: false
@@ -131,11 +133,47 @@ ShellRoot {
     if (dayIndex >= days.length) dayIndex = Math.max(0, days.length - 1)
   }
 
+  function showSavedRange(resetDay) {
+    var saved = (index && index.range && index.range.id) ? index.range.id : "30d"
+    if (saved === "custom" && index.ranges && index.ranges.custom) {
+      customActive = true
+      view = index.ranges.custom
+      var metrics = view.metrics || []
+      if (metricIndex >= metrics.length) metricIndex = Math.max(0, metrics.length - 1)
+      var days = view.days || []
+      if (resetDay || dayIndex >= days.length) dayIndex = Math.max(0, days.length - 1)
+      return
+    }
+    customActive = false
+    var found = rangeIds.indexOf(saved)
+    rangeIndex = found >= 0 ? found : 1
+    rebuild()
+    if (resetDay) {
+      var presetDays = (view && view.days) ? view.days : []
+      dayIndex = Math.max(0, presetDays.length - 1)
+    }
+  }
+
+  function persistRange(id, start, end) {
+    if (!sessionEntered || rangeProc.running) return
+    var args = [syncScript, "--range", id]
+    if (id === "custom") args.push("--range-start", start, "--range-end", end)
+    rangeProc.command = args
+    rangeProc.running = true
+  }
+
   function setRange(index) {
     rangeIndex = Math.max(0, Math.min(rangeIds.length - 1, index))
+    customActive = false
     rebuild()
     var days = (view && view.days) ? view.days : []
     dayIndex = Math.max(0, days.length - 1)
+    persistRange(rangeIds[rangeIndex], "", "")
+  }
+
+  function saveCustomRange(start, end) {
+    if (!start || !end) return
+    persistRange("custom", start, end)
   }
 
   function moveRange(delta) { setRange(rangeIndex + delta) }
@@ -186,11 +224,31 @@ ShellRoot {
     return false
   }
 
+  function focusZone(name) {
+    for (var i = 0; i < zones.length; i++) if (zones[i] === name) zoneIndex = i
+  }
+
+  function noteChatFocused() {
+    if (zone === "chat") return
+    zoneBeforeChat = zoneIndex
+    focusZone("chat")
+  }
+
+  function leaveChatZone() {
+    if (zone === "chat") zoneIndex = zoneBeforeChat
+  }
+
   function cycleZone(dir) {
-    zoneIndex = (zoneIndex + dir + zones.length) % zones.length
+    var next = (zoneIndex + dir + zones.length) % zones.length
+    if (zones[next] === "chat" && zone !== "chat") zoneBeforeChat = zoneIndex
+    if (zone === "chat" || chatSidebar.editing) chatSidebar.releaseInput()
+    zoneIndex = next
+    if (zone === "chat") chatSidebar.focusInput()
+    else keys.forceActiveFocus()
   }
 
   function moveInZone(delta) {
+    if (zone === "chat") return
     if (zone === "ranges") moveRange(delta)
     else if (zone === "metrics") moveMetric(delta)
     else if (zone === "days") moveDay(delta)
@@ -198,6 +256,7 @@ ShellRoot {
   }
 
   function jumpEnds(end) {
+    if (zone === "chat") return
     if (zone === "ranges") setRange(end ? rangeIds.length - 1 : 0)
     else if (zone === "metrics") {
       var metrics = (view && view.metrics) ? view.metrics : []
@@ -418,13 +477,11 @@ ShellRoot {
 
   function applyIndex(raw) {
     try { index = JSON.parse(raw) } catch (e) { return }
-    rebuild()
-    if (!placedDay) {
+    var first = !placedDay
+    showSavedRange(first)
+    if (first) {
       var days = (view && view.days) ? view.days : []
-      if (days.length > 0) {
-        dayIndex = days.length - 1
-        placedDay = true
-      }
+      if (days.length > 0) placedDay = true
     }
   }
 
@@ -540,6 +597,20 @@ ShellRoot {
       usersFile.reload()
       if (exitCode !== 0) toast.show(String(usersErr.text || "").trim() || "Could not update people")
       else if (usersProc.command.length > 1 && usersProc.command[1] === "--add-user") personField.text = ""
+    }
+  }
+  Process {
+    id: rangeProc
+    running: false
+    stderr: StdioCollector { id: rangeErr }
+    onExited: (exitCode) => {
+      if (exitCode !== 0) {
+        toast.show(String(rangeErr.text || "").trim() || "Could not save that date range")
+        board.dragAnchor = -1
+        board.dragEnd = -1
+        return
+      }
+      indexFile.reload()
     }
   }
   Process {
@@ -721,7 +792,27 @@ ShellRoot {
         onActivated: root.useSample()
       }
 
+      function itemContains(item, x, y) {
+        if (!item || !item.visible) return false
+        return item.contains(item.mapFromItem(keys, x, y))
+      }
+
+      MouseArea {
+        z: 25
+        anchors.fill: parent
+        enabled: root.sessionEntered && !root.agentOpen && !root.fileMenuOpen && !root.settingsOpen && !root.keysOpen && root.pendingImport === "" && !root.exportBusy
+        propagateComposedEvents: true
+        onPressed: function(mouse) {
+          mouse.accepted = false
+          if (keys.itemContains(chatSidebar.composerField, mouse.x, mouse.y)) return
+          chatSidebar.releaseInput()
+          root.leaveChatZone()
+          keys.forceActiveFocus()
+        }
+      }
+
       Keys.onPressed: event => {
+        if (chatSidebar.editing) return
         var k = event.key
         var t = event.text
         var shift = (event.modifiers & Qt.ShiftModifier) !== 0
@@ -781,10 +872,7 @@ ShellRoot {
         if (k === Qt.Key_Escape) { Qt.quit(); return }
         if (k === Qt.Key_Tab) { root.cycleZone(shift ? -1 : 1); event.accepted = true; return }
         if (k === Qt.Key_Backtab) { root.cycleZone(-1); event.accepted = true; return }
-        if (t === "1") root.setRange(0)
-        else if (t === "2") root.setRange(1)
-        else if (t === "3") root.setRange(2)
-        else if (t === "4") root.setRange(3)
+        if (t >= "1" && t <= "7" && t.length === 1) root.setRange(t.charCodeAt(0) - 49)
         else if (t === "[") root.moveRange(-1)
         else if (t === "]") root.moveRange(1)
         else if (t === "r") { root.sampleMode = false; root.startSync() }
@@ -911,6 +999,7 @@ ShellRoot {
         dayIndex: root.dayIndex
         zone: root.zone
         rangeIndex: root.rangeIndex
+        customActive: root.customActive
         state: root.screen
         stateMessage: root.status.message || ""
         errorMessage: root.errorMessage
@@ -923,6 +1012,7 @@ ShellRoot {
         blood: (root.library && root.library.blood) ? root.library.blood : []
         urine: (root.library && root.library.urine) ? root.library.urine : []
         onRangeChosen: index => root.setRange(index)
+        onCustomRangeChosen: (start, end) => root.saveCustomRange(start, end)
         onMetricChosen: index => {
           root.metricIndex = index
           root.gallery = ""
@@ -950,6 +1040,12 @@ ShellRoot {
         onSendRequested: text => root.sendChat(text)
         onScopeChosen: name => root.chatScope = name
         onAgentRequested: root.openAgents()
+        onInputFocused: root.noteChatFocused()
+        onFocusTabbed: dir => root.cycleZone(dir)
+        onEditFinished: {
+          root.leaveChatZone()
+          keys.forceActiveFocus()
+        }
       }
 
       Rectangle {
@@ -966,13 +1062,39 @@ ShellRoot {
           anchors.leftMargin: 16
           anchors.rightMargin: 16
           spacing: 16
-          Text {
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Agent  " + root.agentLabel() + (root.agentIsInstalled() ? "" : "  · not on PATH")
-            color: root.zone === "agent" ? appTheme.brightForeground : appTheme.foreground
-            font.family: appTheme.fontFamily
-            font.pixelSize: appTheme.fontSize
-            font.bold: root.zone === "agent"
+          Item {
+            width: agentLaunch.implicitWidth
+            height: parent.height
+            Row {
+              id: agentLaunch
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: 10
+              Text {
+                text: "Agent"
+                color: root.zone === "agent" ? appTheme.brightForeground : appTheme.foreground
+                font.family: appTheme.fontFamily
+                font.pixelSize: appTheme.fontSize
+                font.bold: root.zone === "agent"
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Text {
+                text: root.agentLabel() + (root.agentIsInstalled() ? "" : "  · not on PATH")
+                color: appTheme.accent
+                font.family: appTheme.fontFamily
+                font.pixelSize: appTheme.fontSize
+                font.bold: true
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                root.focusZone("agent")
+                root.openAgents()
+                keys.forceActiveFocus()
+              }
+            }
           }
           Text {
             anchors.verticalCenter: parent.verticalCenter
@@ -981,10 +1103,6 @@ ShellRoot {
             font.family: appTheme.fontFamily
             font.pixelSize: appTheme.fontSize - 2
           }
-        }
-        MouseArea {
-          anchors.fill: parent
-          onClicked: root.zoneIndex = 3
         }
       }
 

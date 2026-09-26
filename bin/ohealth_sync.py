@@ -60,6 +60,9 @@ RANGES = (
     ("30d", "30 days", 30),
     ("90d", "90 days", 90),
     ("365d", "1 year", 365),
+    ("3y", "3 years", 365 * 3),
+    ("5y", "5 years", 365 * 5),
+    ("all", "All", 0),
 )
 
 # Apple Health export quantity identifiers → day field.
@@ -160,7 +163,17 @@ def _open_sqlite(path: Path) -> sqlite3.Connection:
     return conn
 
 
-USER_META_KEYS = ("stored", "source", "sourceDetail", "labeledSample", "exportedAt", "appleId")
+USER_META_KEYS = (
+    "stored",
+    "source",
+    "sourceDetail",
+    "labeledSample",
+    "exportedAt",
+    "appleId",
+    "rangeId",
+    "rangeStart",
+    "rangeEnd",
+)
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -1000,11 +1013,15 @@ def trend_sentence(name: str, aggregate_label: str, value_text: str, unit: str, 
 
 
 def build_range(rows: list[dict], range_id: str, label: str, length: int) -> dict:
-    current = rows[-length:] if len(rows) > length else list(rows)
-    if len(rows) > length:
-        previous = rows[-(length * 2):-length]
+    if length <= 0:
+        current = list(rows)
+        previous: list[dict] = []
     else:
-        previous = []
+        current = rows[-length:] if len(rows) > length else list(rows)
+        if len(rows) > length:
+            previous = rows[-(length * 2):-length]
+        else:
+            previous = []
     if len(previous) < max(3, length // 5):
         previous = []
     metrics = []
@@ -1210,9 +1227,84 @@ def choose_database() -> str | None:
     return choose_file("Choose OHealth database", "sqlite db")
 
 
+def active_range() -> tuple[str, str, str]:
+    """This person's saved window. Preset ids match RANGES; custom uses calendar dates."""
+    known = {item[0] for item in RANGES}
+    conn = connect_db()
+    try:
+        person = current_user_row(conn)
+        if person is None:
+            return "30d", "", ""
+        saved = {
+            row["key"]: row["value"]
+            for row in conn.execute(
+                "SELECT key, value FROM user_meta WHERE user_id = ? AND key IN ('rangeId', 'rangeStart', 'rangeEnd')",
+                (person["id"],),
+            )
+        }
+    finally:
+        conn.close()
+    range_id = saved.get("rangeId") or "30d"
+    start = (saved.get("rangeStart") or "").strip()
+    end = (saved.get("rangeEnd") or "").strip()
+    if range_id == "custom" and start and end:
+        return "custom", start, end
+    if range_id not in known:
+        range_id = "30d"
+    return range_id, "", ""
+
+
+def set_saved_range(range_id: str, start: str | None, end: str | None) -> None:
+    known = {item[0] for item in RANGES}
+    if range_id != "custom" and range_id not in known:
+        raise ValueError("Unknown date range.")
+    conn = connect_db()
+    try:
+        person = require_user(conn)
+        if range_id == "custom":
+            if not start or not end:
+                raise ValueError("A custom range needs a start and an end date.")
+            try:
+                start_day = date.fromisoformat(start).isoformat()
+                end_day = date.fromisoformat(end).isoformat()
+            except ValueError as exc:
+                raise ValueError("Use dates like 2026-09-01.") from exc
+            if start_day > end_day:
+                start_day, end_day = end_day, start_day
+            save_user_meta(conn, person["id"], {
+                "rangeId": "custom",
+                "rangeStart": start_day,
+                "rangeEnd": end_day,
+            })
+        else:
+            save_user_meta(conn, person["id"], {
+                "rangeId": range_id,
+                "rangeStart": "",
+                "rangeEnd": "",
+            })
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def build_custom_range(rows: list[dict], start: str, end: str) -> dict:
+    current = [row for row in rows if start <= row["date"] <= end]
+    span = len(current)
+    if span == 0:
+        block = build_range([], "custom", "Custom", 1)
+    else:
+        before = [row for row in rows if row["date"] < start]
+        block = build_range(before[-span:] + current, "custom", "Custom", span)
+    block["start"] = start
+    block["end"] = end
+    return block
+
+
 def build_index(rows: list[dict], source: str, source_detail: str, labeled_sample: bool, exported_at: str | None, apple_id: str) -> dict:
-    # Keep a year plus the previous window so 365d can still compare.
-    trimmed = rows[-800:]
+    range_id, start, end = active_range()
+    ranges = {item_id: build_range(rows, item_id, label, length) for item_id, label, length in RANGES}
+    if range_id == "custom":
+        ranges["custom"] = build_custom_range(rows, start, end)
     return {
         "schema": 1,
         "labeledSample": labeled_sample,
@@ -1221,7 +1313,8 @@ def build_index(rows: list[dict], source: str, source_detail: str, labeled_sampl
         "builtAt": now_iso(),
         "exportedAt": exported_at,
         "appleId": apple_id,
-        "ranges": {range_id: build_range(trimmed, range_id, label, length) for range_id, label, length in RANGES},
+        "range": {"id": range_id, "start": start, "end": end},
+        "ranges": ranges,
     }
 
 
@@ -1559,6 +1652,9 @@ def run(
     add_person: str | None = None,
     select_person: str | None = None,
     list_people: bool = False,
+    range_id: str | None = None,
+    range_start: str | None = None,
+    range_end: str | None = None,
 ) -> int:
     ensure_layout()
     if record_kind:
@@ -1603,7 +1699,9 @@ def run(
             add_user(add_person)
         if select_person:
             set_current_user(select_person)
-        if (list_people or add_person) and not select_person and not sample and not export and not inbox and not record_kind:
+        if range_id:
+            set_saved_range(range_id, range_start, range_end)
+        if (list_people or add_person) and not select_person and not sample and not export and not inbox and not record_kind and not range_id:
             if list_people and not add_person:
                 publish_users()
             return 0
@@ -1680,6 +1778,9 @@ def main() -> None:
     parser.add_argument("--users", action="store_true", help="write the people in this database")
     parser.add_argument("--add-user", help="add a person to this database")
     parser.add_argument("--user", help="open the database as this person")
+    parser.add_argument("--range", help="save this person's date range: 7d, 30d, 90d, 365d, 3y, 5y, all, or custom")
+    parser.add_argument("--range-start", help="custom range start date")
+    parser.add_argument("--range-end", help="custom range end date")
     args = parser.parse_args()
     kind = "xray" if args.xray else "blood" if args.blood else "urine" if args.urine else None
     sys.exit(run(
@@ -1695,6 +1796,9 @@ def main() -> None:
         args.add_user,
         args.user,
         args.users,
+        args.range,
+        args.range_start,
+        args.range_end,
     ))
 
 

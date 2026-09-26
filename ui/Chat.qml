@@ -13,12 +13,26 @@ Item {
   signal sendRequested(string text)
   signal scopeChosen(string scope)
   signal agentRequested()
+  signal editFinished()
+  signal inputFocused()
+  signal focusTabbed(int direction)
+
+  readonly property bool editing: draft.activeFocus
+  readonly property Item composerField: draftBox
 
   function submit() {
     var text = draft.text.trim()
     if (!text || root.busy) return
     draft.text = ""
     root.sendRequested(text)
+  }
+
+  function releaseInput() {
+    draft.focus = false
+  }
+
+  function focusInput() {
+    draft.forceActiveFocus()
   }
 
   Rectangle {
@@ -155,17 +169,25 @@ Item {
         width: parent.width
         spacing: 6
         Rectangle {
+          id: draftBox
           width: parent.width - send.width - 6
           height: 36
           radius: 6
           color: theme.darkBackground
-          border.width: 1
-          border.color: theme.lighterBackground
+          border.width: draft.activeFocus ? 2 : 1
+          border.color: draft.activeFocus ? theme.accent : theme.lighterBackground
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.IBeamCursor
+            onClicked: draft.forceActiveFocus()
+          }
           TextInput {
             id: draft
             anchors.fill: parent
             anchors.margins: 8
             clip: true
+            focus: false
+            readOnly: !activeFocus
             color: theme.brightForeground
             font.family: theme.fontFamily
             font.pixelSize: theme.fontSize
@@ -173,6 +195,20 @@ Item {
             selectByMouse: true
             Keys.onReturnPressed: root.submit()
             Keys.onEnterPressed: root.submit()
+            Keys.onEscapePressed: {
+              focus = false
+              root.editFinished()
+            }
+            Keys.onTabPressed: event => {
+              var shift = (event.modifiers & Qt.ShiftModifier) !== 0
+              root.focusTabbed(shift ? -1 : 1)
+              event.accepted = true
+            }
+            Keys.onBacktabPressed: event => {
+              root.focusTabbed(-1)
+              event.accepted = true
+            }
+            onActiveFocusChanged: if (activeFocus) root.inputFocused()
           }
         }
         Rectangle {
