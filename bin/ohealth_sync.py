@@ -2,16 +2,18 @@
 """Build the health index the Quickshell window watches.
 
 HealthKit has no cloud API. This script never pretends to fetch one.
-It reads, in order:
+An import reads an export once and stores the days in:
 
-  1. --export PATH, or EXPORT= in ~/.config/ohealth/config
-  2. ~/.local/share/ohealth/inbox  (export.zip, export.xml, or JSON)
+  ~/.config/ohealth/ohealth.sqlite
 
-Accepted inputs are Apple's "Export All Health Data" zip/XML, and JSON
+Opening the app, and running this script with no file arguments, reads
+that database. It does not open the export again.
+
+Accepted imports are Apple's "Export All Health Data" zip/XML, and JSON
 written by Health Auto Export. --sample writes an invented series and
 marks it labeledSample so the window can say so.
 
-Output (atomic, mode 0600):
+The window still watches a view of that database (atomic, mode 0600):
 
   ~/.cache/ohealth/index.json
   ~/.cache/ohealth/status.json
@@ -20,10 +22,17 @@ Output (atomic, mode 0600):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import shutil
+import sqlite3
+import subprocess
 import sys
+import threading
+import time
+import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
@@ -33,11 +42,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ohealth_paths import (  # noqa: E402
     cache_dir,
+    db_path,
     ensure_layout,
     inbox_dir,
     index_path,
     read_config,
     status_path,
+    xray_dir,
+    document_dir,
+    files_path,
+    chat_path,
+    users_path,
 )
 
 RANGES = (
@@ -107,6 +122,7 @@ METRICS = (
 )
 
 SUMMARY_IDS = ("steps", "sleepHours", "restingHr", "hrv")
+DAY_FIELDS = tuple(spec["id"] for spec in METRICS)
 
 
 def now_iso() -> str:
@@ -123,7 +139,469 @@ def write_json(path: Path, payload: dict) -> None:
 
 def write_status(state: str, message: str, **extra) -> None:
     body = {"state": state, "message": message, "at": now_iso(), **extra}
+    if "database" not in body:
+        body["database"] = str(selected_db_path())
+    if "user" not in body:
+        try:
+            uid, name = current_person()
+        except Exception:
+            uid, name = "", ""
+        body["user"] = uid
+        body["userName"] = name
     write_json(status_path(), body)
+
+
+def _open_sqlite(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=DELETE")
+    return conn
+
+
+USER_META_KEYS = ("stored", "source", "sourceDetail", "labeledSample", "exportedAt", "appleId")
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _columns(conn: sqlite3.Connection, name: str) -> list[str]:
+    if not _table_exists(conn, name):
+        return []
+    return [row["name"] for row in conn.execute(f"PRAGMA table_info({name})")]
+
+
+def _create_tables(conn: sqlite3.Connection) -> None:
+    columns = ", ".join(f"{name} REAL" for name in DAY_FIELDS)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS days ("
+        "user_id TEXT NOT NULL, date TEXT NOT NULL, "
+        f"{columns}, PRIMARY KEY (user_id, date))"
+    )
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_meta (
+          user_id TEXT NOT NULL,
+          key TEXT NOT NULL,
+          value TEXT NOT NULL,
+          PRIMARY KEY (user_id, key)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS samples (
+          user_id TEXT NOT NULL,
+          id TEXT NOT NULL,
+          day TEXT NOT NULL,
+          field TEXT NOT NULL,
+          op TEXT NOT NULL,
+          value REAL NOT NULL,
+          at TEXT NOT NULL,
+          PRIMARY KEY (user_id, id)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS samples_user_day ON samples(user_id, day)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS files (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          name TEXT NOT NULL,
+          path TEXT NOT NULL,
+          added_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS files_user ON files(user_id)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat (
+          id INTEGER PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          role TEXT NOT NULL,
+          agent TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          body TEXT NOT NULL,
+          at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS chat_user ON chat(user_id)")
+
+
+def _needs_owner(conn: sqlite3.Connection) -> bool:
+    for table in ("days", "samples", "files", "chat"):
+        if _table_exists(conn, table) and conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+            return True
+    if _table_exists(conn, "meta"):
+        stored = conn.execute("SELECT value FROM meta WHERE key = 'stored'").fetchone()
+        if stored is not None and stored["value"] == "1":
+            return True
+    return False
+
+
+def _legacy_owner(conn: sqlite3.Connection) -> str:
+    """Attach rows saved before people existed to one person."""
+    row = conn.execute("SELECT id FROM users LIMIT 1").fetchone()
+    if row:
+        return row["id"]
+    apple = conn.execute("SELECT value FROM meta WHERE key = 'appleId'").fetchone() if _table_exists(conn, "meta") else None
+    name = (apple["value"] if apple else "").strip() or "Existing"
+    uid = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO users (id, name, created_at) VALUES (?, ?, ?)",
+        (uid, name, now_iso()),
+    )
+    if _table_exists(conn, "meta"):
+        saved = {record["key"]: record["value"] for record in conn.execute("SELECT key, value FROM meta")}
+        for key in USER_META_KEYS:
+            if key in saved:
+                conn.execute(
+                    "INSERT INTO user_meta (user_id, key, value) VALUES (?, ?, ?)",
+                    (uid, key, saved[key]),
+                )
+    return uid
+
+
+def _rebuild_days(conn: sqlite3.Connection, owner: str) -> None:
+    columns = ", ".join(f"{name} REAL" for name in DAY_FIELDS)
+    listed = ", ".join(DAY_FIELDS)
+    conn.execute(
+        "CREATE TABLE days_next ("
+        "user_id TEXT NOT NULL, date TEXT NOT NULL, "
+        f"{columns}, PRIMARY KEY (user_id, date))"
+    )
+    conn.execute(
+        f"INSERT INTO days_next (user_id, date, {listed}) SELECT ?, date, {listed} FROM days",
+        (owner,),
+    )
+    conn.execute("DROP TABLE days")
+    conn.execute("ALTER TABLE days_next RENAME TO days")
+
+
+def _rebuild_samples(conn: sqlite3.Connection, owner: str) -> None:
+    conn.execute("DROP INDEX IF EXISTS samples_day")
+    conn.execute(
+        """
+        CREATE TABLE samples_next (
+          user_id TEXT NOT NULL,
+          id TEXT NOT NULL,
+          day TEXT NOT NULL,
+          field TEXT NOT NULL,
+          op TEXT NOT NULL,
+          value REAL NOT NULL,
+          at TEXT NOT NULL,
+          PRIMARY KEY (user_id, id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO samples_next (user_id, id, day, field, op, value, at)
+        SELECT ?, id, day, field, op, value, at FROM samples
+        """,
+        (owner,),
+    )
+    conn.execute("DROP TABLE samples")
+    conn.execute("ALTER TABLE samples_next RENAME TO samples")
+
+
+def _claim_column(conn: sqlite3.Connection, table: str, owner: str) -> None:
+    if "user_id" in _columns(conn, table):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+    conn.execute(f"UPDATE {table} SET user_id = ? WHERE user_id = ''", (owner,))
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    legacy_days = _table_exists(conn, "days") and "user_id" not in _columns(conn, "days")
+    legacy_samples = _table_exists(conn, "samples") and "user_id" not in _columns(conn, "samples")
+    legacy_files = _table_exists(conn, "files") and "user_id" not in _columns(conn, "files")
+    legacy_chat = _table_exists(conn, "chat") and "user_id" not in _columns(conn, "chat")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_meta (
+          user_id TEXT NOT NULL,
+          key TEXT NOT NULL,
+          value TEXT NOT NULL,
+          PRIMARY KEY (user_id, key)
+        )
+        """
+    )
+    owner = _legacy_owner(conn) if (legacy_days or legacy_samples or legacy_files or legacy_chat) and _needs_owner(conn) else ""
+    if legacy_days:
+        if owner:
+            _rebuild_days(conn, owner)
+        else:
+            conn.execute("DROP TABLE days")
+    if legacy_samples:
+        if owner:
+            _rebuild_samples(conn, owner)
+        else:
+            conn.execute("DROP INDEX IF EXISTS samples_day")
+            conn.execute("DROP TABLE samples")
+    if legacy_files:
+        if owner:
+            _claim_column(conn, "files", owner)
+        else:
+            conn.execute("DROP TABLE files")
+    if legacy_chat:
+        if owner:
+            _claim_column(conn, "chat", owner)
+        else:
+            conn.execute("DROP TABLE chat")
+    _create_tables(conn)
+    conn.commit()
+
+
+def selected_db_path() -> Path:
+    """The database the window reads. The choice is stored in the OHealth database."""
+    catalog = db_path()
+    conn = _open_sqlite(catalog)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        row = conn.execute("SELECT value FROM meta WHERE key = 'database'").fetchone()
+        chosen = (row["value"] if row else "").strip()
+        if not chosen:
+            chosen = str(catalog)
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('database', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (chosen,),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+    os.chmod(catalog, 0o600)
+    return Path(chosen)
+
+
+def set_selected_database(path: Path) -> None:
+    chosen = Path(os.path.expanduser(str(path))).resolve()
+    if chosen.suffix.lower() not in {".sqlite", ".db"}:
+        raise ValueError("Choose a database file ending in .sqlite")
+    chosen.parent.mkdir(parents=True, exist_ok=True)
+    catalog = db_path()
+    conn = _open_sqlite(catalog)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('database', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(chosen),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    os.chmod(catalog, 0o600)
+    health = connect_db()
+    health.close()
+
+
+def connect_db() -> sqlite3.Connection:
+    """Local health store. One file, mode 0600, no leftover WAL sidecar."""
+    path = selected_db_path()
+    conn = _open_sqlite(path)
+    _ensure_schema(conn)
+    os.chmod(path, 0o600)
+    return conn
+
+
+def current_user_row(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = 'user'").fetchone()
+    uid = (row["value"] if row else "").strip()
+    if not uid:
+        return None
+    return conn.execute("SELECT id, name FROM users WHERE id = ?", (uid,)).fetchone()
+
+
+def current_person() -> tuple[str, str]:
+    conn = connect_db()
+    try:
+        row = current_user_row(conn)
+        if row is None:
+            return "", ""
+        return row["id"], row["name"]
+    finally:
+        conn.close()
+
+
+def require_user(conn: sqlite3.Connection) -> sqlite3.Row:
+    row = current_user_row(conn)
+    if row is None:
+        raise ValueError("Choose a person before importing.")
+    return row
+
+
+def save_user_meta(conn: sqlite3.Connection, user_id: str, meta: dict[str, str]) -> None:
+    for key, value in meta.items():
+        conn.execute(
+            "INSERT INTO user_meta (user_id, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value",
+            (user_id, key, value),
+        )
+
+
+def list_users() -> list[dict]:
+    conn = connect_db()
+    try:
+        return [
+            {"id": row["id"], "name": row["name"]}
+            for row in conn.execute("SELECT id, name FROM users ORDER BY name COLLATE NOCASE, created_at")
+        ]
+    finally:
+        conn.close()
+
+
+def publish_users() -> None:
+    conn = connect_db()
+    try:
+        people = [
+            {"id": row["id"], "name": row["name"]}
+            for row in conn.execute("SELECT id, name FROM users ORDER BY name COLLATE NOCASE, created_at")
+        ]
+        person = current_user_row(conn)
+    finally:
+        conn.close()
+    write_json(users_path(), {
+        "users": people,
+        "current": person["id"] if person else "",
+        "currentName": person["name"] if person else "",
+    })
+
+
+def add_user(name: str) -> dict:
+    cleaned = " ".join(name.split())
+    if not cleaned:
+        raise ValueError("Enter a name.")
+    conn = connect_db()
+    try:
+        taken = conn.execute(
+            "SELECT name FROM users WHERE lower(name) = lower(?)",
+            (cleaned,),
+        ).fetchone()
+        if taken:
+            raise ValueError(f"{taken['name']} is already in this database.")
+        uid = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO users (id, name, created_at) VALUES (?, ?, ?)",
+            (uid, cleaned, now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    publish_users()
+    return {"id": uid, "name": cleaned}
+
+
+def set_current_user(user_id: str) -> None:
+    conn = connect_db()
+    try:
+        row = conn.execute("SELECT id, name FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None:
+            raise ValueError("That person is not in this database.")
+        save_meta(conn, {"user": row["id"]})
+        conn.commit()
+    finally:
+        conn.close()
+    publish_users()
+
+
+def store_days(
+    rows: list[dict],
+    *,
+    source: str,
+    source_detail: str,
+    labeled_sample: bool,
+    exported_at: str | None,
+    apple_id: str,
+) -> None:
+    """Replace this person's saved days with this import."""
+    conn = connect_db()
+    names = ", ".join(["user_id", "date", *DAY_FIELDS])
+    marks = ", ".join("?" for _ in range(2 + len(DAY_FIELDS)))
+    meta = {
+        "stored": "1",
+        "source": source,
+        "sourceDetail": source_detail,
+        "labeledSample": "1" if labeled_sample else "0",
+        "exportedAt": exported_at or "",
+        "appleId": apple_id or "",
+    }
+    try:
+        with conn:
+            person = require_user(conn)
+            conn.execute("DELETE FROM days WHERE user_id = ?", (person["id"],))
+            conn.execute("DELETE FROM samples WHERE user_id = ?", (person["id"],))
+            for row in rows:
+                values: list = [person["id"], row["date"]]
+                for field in DAY_FIELDS:
+                    value = row.get(field)
+                    values.append(None if value is None else float(value))
+                conn.execute(f"INSERT INTO days ({names}) VALUES ({marks})", values)
+            save_user_meta(conn, person["id"], meta)
+    finally:
+        conn.close()
+
+
+def load_days() -> tuple[list[dict], dict[str, str]]:
+    conn = connect_db()
+    try:
+        meta = {
+            row["key"]: row["value"]
+            for row in conn.execute("SELECT key, value FROM meta")
+            if row["key"] not in USER_META_KEYS
+        }
+        person = current_user_row(conn)
+        if person is None:
+            meta["user"] = ""
+            meta["userName"] = ""
+            return [], meta
+        meta["user"] = person["id"]
+        meta["userName"] = person["name"]
+        for row in conn.execute("SELECT key, value FROM user_meta WHERE user_id = ?", (person["id"],)):
+            meta[row["key"]] = row["value"]
+        rows: list[dict] = []
+        query = "SELECT date, " + ", ".join(DAY_FIELDS) + " FROM days WHERE user_id = ? ORDER BY date"
+        for record in conn.execute(query, (person["id"],)):
+            row: dict = {"date": record["date"]}
+            for field in DAY_FIELDS:
+                value = record[field]
+                if value is not None:
+                    row[field] = float(value)
+            rows.append(row)
+        return rows, meta
+    finally:
+        conn.close()
 
 
 def parse_apple_dt(value: str) -> datetime | None:
@@ -195,20 +673,24 @@ class DayBucket:
         return row
 
 
-def rows_from_buckets(buckets: dict[str, DayBucket]) -> list[dict]:
-    return [buckets[day].as_dict(day) for day in sorted(buckets)]
+def sample_id(op: str, field: str, start: str, end: str, unit: str) -> str:
+    """Same health record, even when a later export repeats it."""
+    raw = f"{op}|{field}|{start}|{end}|{unit}"
+    return hashlib.sha1(raw.encode()).hexdigest()
 
 
-def bucket_for(buckets: dict[str, DayBucket], day: str) -> DayBucket:
-    found = buckets.get(day)
-    if found is None:
-        found = DayBucket()
-        buckets[day] = found
-    return found
+def emit_sample(emit, op: str, field: str, start: str, end: str, unit: str, day: str, value: float, at: datetime) -> None:
+    emit({
+        "id": sample_id(op, field, start, end, unit),
+        "day": day,
+        "field": field,
+        "op": op,
+        "value": value,
+        "at": at.isoformat(),
+    })
 
 
-def parse_export_xml(path: Path) -> tuple[list[dict], str | None]:
-    buckets: dict[str, DayBucket] = {}
+def parse_export_xml(path: Path, emit) -> str | None:
     exported_at = None
     context = ET.iterparse(path, events=("start", "end"))
     _event, root = next(context)
@@ -223,11 +705,14 @@ def parse_export_xml(path: Path) -> tuple[list[dict], str | None]:
         if tag != "Record":
             continue
         kind = elem.attrib.get("type", "")
-        start = parse_apple_dt(elem.attrib.get("startDate", ""))
-        end = parse_apple_dt(elem.attrib.get("endDate", "")) or start
+        start_raw = elem.attrib.get("startDate", "")
+        end_raw = elem.attrib.get("endDate", "") or start_raw
+        start = parse_apple_dt(start_raw)
+        end = parse_apple_dt(end_raw) or start
         if start is None:
             root.clear()
             continue
+        unit = elem.attrib.get("unit", "")
         if kind == "HKCategoryTypeIdentifierSleepAnalysis":
             try:
                 category = int(float(elem.attrib.get("value", "nan")))
@@ -237,7 +722,7 @@ def parse_export_xml(path: Path) -> tuple[list[dict], str | None]:
                 hours = (end - start).total_seconds() / 3600.0
                 # Cap a single fragment at 16h so a bad timestamp cannot dominate.
                 if 0 < hours <= 16:
-                    bucket_for(buckets, day_key(start)).add_sleep(hours)
+                    emit_sample(emit, "sleep", "sleepHours", start_raw, end_raw, unit, day_key(start), hours, end)
             root.clear()
             continue
         field = SUM_FIELDS.get(kind) or AVG_FIELDS.get(kind) or LAST_FIELDS.get(kind)
@@ -252,16 +737,17 @@ def parse_export_xml(path: Path) -> tuple[list[dict], str | None]:
         if math.isnan(raw):
             root.clear()
             continue
-        value = convert_quantity(field, raw, elem.attrib.get("unit", ""))
-        bucket = bucket_for(buckets, day_key(start))
+        value = convert_quantity(field, raw, unit)
+        when = end or start
         if kind in SUM_FIELDS:
-            bucket.add_sum(field, value)
+            op = "sum"
         elif kind in AVG_FIELDS:
-            bucket.add_avg(field, value)
+            op = "avg"
         else:
-            bucket.add_last(field, end or start, value)
+            op = "last"
+        emit_sample(emit, op, field, start_raw, end_raw, unit, day_key(start), value, when)
         root.clear()
-    return rows_from_buckets(buckets), exported_at
+    return exported_at
 
 
 def _hae_points(metric: dict) -> list[dict]:
@@ -281,7 +767,7 @@ def _hae_qty(point: dict) -> float | None:
     return None
 
 
-def parse_health_auto_json(path: Path) -> list[dict]:
+def parse_health_auto_json(path: Path, emit) -> None:
     payload = json.loads(path.read_text())
     metrics = []
     if isinstance(payload, dict):
@@ -290,7 +776,6 @@ def parse_health_auto_json(path: Path) -> list[dict]:
             metrics = data["metrics"]
         elif isinstance(payload.get("metrics"), list):
             metrics = payload["metrics"]
-    buckets: dict[str, DayBucket] = {}
     for metric in metrics:
         if not isinstance(metric, dict):
             continue
@@ -301,9 +786,11 @@ def parse_health_auto_json(path: Path) -> list[dict]:
         if field is None and not sleep:
             continue
         for point in _hae_points(metric):
-            when = parse_apple_dt(str(point.get("date") or point.get("start") or point.get("startDate") or ""))
+            raw_when = str(point.get("date") or point.get("start") or point.get("startDate") or "")
+            when = parse_apple_dt(raw_when)
             if when is None:
                 continue
+            raw_end = str(point.get("end") or point.get("endDate") or raw_when)
             if sleep:
                 qty = None
                 for key in ("totalSleep", "asleep", "qty", "value"):
@@ -315,51 +802,37 @@ def parse_health_auto_json(path: Path) -> list[dict]:
                         break
                 if qty is None:
                     continue
-                # Health Auto Export reports sleep in hours.
-                bucket_for(buckets, day_key(when)).add_sleep(qty)
+                emit_sample(emit, "sleep", "sleepHours", raw_when, raw_end, units, day_key(when), qty, when)
                 continue
             qty = _hae_qty(point)
             if qty is None or field is None:
                 continue
             value = convert_quantity(field, qty, units)
-            bucket = bucket_for(buckets, day_key(when))
+            end = parse_apple_dt(raw_end) or when
             if name in HAE_SUM:
-                bucket.add_sum(field, value)
+                op = "sum"
             elif name in HAE_AVG:
-                bucket.add_avg(field, value)
+                op = "avg"
             else:
-                end = parse_apple_dt(str(point.get("end") or point.get("endDate") or "")) or when
-                bucket.add_last(field, end, value)
-    return rows_from_buckets(buckets)
+                op = "last"
+            emit_sample(emit, op, field, raw_when, raw_end, units, day_key(when), value, end)
 
 
-def parse_health_auto_dir(path: Path) -> list[dict]:
-    merged: dict[str, dict] = {}
-    files = sorted(path.glob("*.json"))
-    for file in files:
-        for row in parse_health_auto_json(file):
-            day = row["date"]
-            slot = merged.setdefault(day, {"date": day})
-            for key, value in row.items():
-                if key == "date":
-                    continue
-                # Later files in name order win for last-style fields; sums add
-                # only when the day was not already present for that field.
-                if key not in slot:
-                    slot[key] = value
-    return [merged[day] for day in sorted(merged)]
+def parse_health_auto_dir(path: Path, emit) -> None:
+    for file in sorted(path.glob("*.json")):
+        parse_health_auto_json(file, emit)
 
 
-def load_export(path: Path) -> tuple[list[dict], str, str | None]:
+def load_export(path: Path, emit) -> tuple[str, str | None]:
     if path.is_dir():
         zip_files = sorted(path.glob("*.zip"), key=lambda item: item.stat().st_mtime, reverse=True)
         xml_files = sorted(path.glob("*.xml"), key=lambda item: item.stat().st_mtime, reverse=True)
         if zip_files:
-            return load_export(zip_files[0])
+            return load_export(zip_files[0], emit)
         if xml_files:
-            return load_export(xml_files[0])
-        rows = parse_health_auto_dir(path)
-        return rows, "health-auto-export", None
+            return load_export(xml_files[0], emit)
+        parse_health_auto_dir(path, emit)
+        return "health-auto-export", None
     if path.suffix.lower() == ".zip" or zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as archive:
             names = [name for name in archive.namelist() if name.endswith("export.xml") or name.endswith(".xml")]
@@ -371,12 +844,16 @@ def load_export(path: Path) -> tuple[list[dict], str, str | None]:
             with archive.open(names[0]) as src, extracted.open("wb") as dst:
                 dst.write(src.read())
             os.chmod(extracted, 0o600)
-        rows, exported = parse_export_xml(extracted)
-        return rows, "apple-health-export", exported
+        try:
+            exported = parse_export_xml(extracted, emit)
+        finally:
+            extracted.unlink(missing_ok=True)
+        return "apple-health-export", exported
     if path.suffix.lower() == ".json":
-        return parse_health_auto_json(path), "health-auto-export", None
-    rows, exported = parse_export_xml(path)
-    return rows, "apple-health-export", exported
+        parse_health_auto_json(path, emit)
+        return "health-auto-export", None
+    exported = parse_export_xml(path, emit)
+    return "apple-health-export", exported
 
 
 def find_input(export: str | None) -> Path | None:
@@ -599,6 +1076,140 @@ def build_range(rows: list[dict], range_id: str, label: str, length: int) -> dic
     }
 
 
+CHOOSER_TITLE = "Open Apple Health export"
+
+
+def hypr_clients() -> list[dict] | None:
+    try:
+        raw = subprocess.check_output(["hyprctl", "clients", "-j"], text=True, timeout=1)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def hypr_dispatch(expression: str) -> None:
+    try:
+        subprocess.run(
+            ["hyprctl", "dispatch", expression],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+
+
+def chooser_client(clients: list[dict], before: set[str], title: str) -> dict | None:
+    """The file dialog that appeared for this open, not a window already on screen."""
+    fallback = None
+    for client in clients:
+        address = client.get("address") or ""
+        if not address or address in before:
+            continue
+        klass = client.get("class") or ""
+        if title in (client.get("title") or ""):
+            return client
+        if fallback is None and ("FileChooser" in klass or "Strata" in klass):
+            fallback = client
+    return fallback
+
+
+def app_window(clients: list[dict]) -> dict | None:
+    for client in clients:
+        if client.get("title") == "OHealth" and client.get("class") == "org.quickshell":
+            return client
+    return None
+
+
+def _raise_chooser(before: set[str], stop: threading.Event, app_address: str, app_was_pinned: bool, unpinned: threading.Event, title: str) -> None:
+    """Keep the new file dialog above OHealth until the user finishes with it.
+
+    OHealth floats, and a pinned float stays above other windows. The dialog
+    has to float too, sit at the top of that stack, and take focus.
+    """
+    raised_until = 0.0
+    while not stop.is_set():
+        clients = hypr_clients()
+        if clients is None:
+            stop.wait(0.05)
+            continue
+        target = chooser_client(clients, before, title)
+        if target is None:
+            stop.wait(0.05)
+            continue
+        selector = "address:" + target["address"]
+        if raised_until == 0.0:
+            raised_until = time.monotonic() + 1.5
+            if app_was_pinned and app_address:
+                hypr_dispatch(f'hl.dsp.window.pin({{ action = "off", window = "address:{app_address}" }})')
+                unpinned.set()
+        if time.monotonic() < raised_until:
+            hypr_dispatch(f'hl.dsp.window.float({{ action = "set", window = "{selector}" }})')
+            hypr_dispatch(f'hl.dsp.window.alter_zorder({{ mode = "top", window = "{selector}" }})')
+            hypr_dispatch(f'hl.dsp.focus({{ window = "{selector}" }})')
+        stop.wait(0.1)
+
+
+def choose_file(title: str, extensions: str) -> str | None:
+    """Open the desktop file manager and return the file it was given.
+
+    omarchy-file-select asks the portal file chooser, which opens the default
+    file manager. Nothing picked is not an error. On Hyprland the dialog is
+    raised in front of the OHealth window, which otherwise floats above it.
+    """
+    clients = hypr_clients() or []
+    before = {client.get("address") or "" for client in clients}
+    app = app_window(clients)
+    app_address = (app or {}).get("address") or ""
+    app_was_pinned = bool((app or {}).get("pinned"))
+    stop = threading.Event()
+    unpinned = threading.Event()
+    raiser = threading.Thread(
+        target=_raise_chooser,
+        args=(before, stop, app_address, app_was_pinned, unpinned, title),
+        daemon=True,
+    )
+    raiser.start()
+    try:
+        result = subprocess.run(
+            ["omarchy-file-select", "--title", title, "--extensions", extensions],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "The file manager is not available. omarchy-file-select is not on PATH."
+        ) from exc
+    finally:
+        stop.set()
+        raiser.join(timeout=2)
+        if app_address:
+            if unpinned.is_set():
+                hypr_dispatch(f'hl.dsp.window.pin({{ action = "on", window = "address:{app_address}" }})')
+            hypr_dispatch(f'hl.dsp.focus({{ window = "address:{app_address}" }})')
+    if result.returncode == 1:
+        return None
+    if result.returncode != 0:
+        message = result.stderr.strip() or "Could not open the file manager"
+        raise RuntimeError(message)
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return lines[0] if lines else None
+
+
+def choose_export() -> str | None:
+    return choose_file(CHOOSER_TITLE, "zip xml json")
+
+
+def choose_database() -> str | None:
+    return choose_file("Choose OHealth database", "sqlite db")
+
+
 def build_index(rows: list[dict], source: str, source_detail: str, labeled_sample: bool, exported_at: str | None, apple_id: str) -> dict:
     # Keep a year plus the previous window so 365d can still compare.
     trimmed = rows[-800:]
@@ -618,51 +1229,434 @@ def empty_index(apple_id: str, detail: str) -> dict:
     return build_index([], "none", detail, False, None, apple_id)
 
 
-def run(sample: bool, export: str | None, sample_end: str | None) -> int:
+EMPTY_DETAIL = (
+    "No Health export yet. Use File → Import from Apple HealthKit Export to choose "
+    "the export.zip from the iPhone Health app. Apple does not offer a HealthKit "
+    "cloud API. A file in the inbox works too."
+)
+
+
+def publish_library() -> None:
+    """Write this person's file list and chat. Rows stay in sqlite."""
+    conn = connect_db()
+    try:
+        person = current_user_row(conn)
+        uid = person["id"] if person else ""
+        files = {"xrays": [], "blood": [], "urine": []}
+        bucket = {"xray": "xrays", "blood": "blood", "urine": "urine"}
+        messages = []
+        if uid:
+            for row in conn.execute(
+                "SELECT id, kind, name, path, added_at FROM files WHERE user_id = ? ORDER BY added_at",
+                (uid,),
+            ):
+                key = bucket.get(row["kind"])
+                if key is None:
+                    continue
+                files[key].append({
+                    "id": row["id"],
+                    "kind": row["kind"],
+                    "name": row["name"],
+                    "path": row["path"],
+                    "addedAt": row["added_at"],
+                })
+            for row in conn.execute(
+                "SELECT id, role, agent, scope, body, at FROM chat WHERE user_id = ? ORDER BY id",
+                (uid,),
+            ):
+                messages.append({
+                    "id": row["id"],
+                    "role": row["role"],
+                    "agent": row["agent"],
+                    "scope": row["scope"],
+                    "body": row["body"],
+                    "at": row["at"],
+                })
+    finally:
+        conn.close()
+    write_json(files_path(), files)
+    write_json(chat_path(), {"messages": messages})
+    publish_users()
+
+
+def list_files() -> list[dict]:
+    conn = connect_db()
+    try:
+        person = current_user_row(conn)
+        if person is None:
+            return []
+        return [
+            {"id": row["id"], "kind": row["kind"], "name": row["name"], "path": row["path"], "addedAt": row["added_at"]}
+            for row in conn.execute(
+                "SELECT id, kind, name, path, added_at FROM files WHERE user_id = ? ORDER BY added_at",
+                (person["id"],),
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def load_chat(limit: int = 12) -> list[dict]:
+    conn = connect_db()
+    try:
+        person = current_user_row(conn)
+        if person is None:
+            return []
+        rows = list(conn.execute(
+            "SELECT role, agent, scope, body FROM chat WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (person["id"], limit),
+        ))
+    finally:
+        conn.close()
+    rows.reverse()
+    return [{"role": row["role"], "agent": row["agent"], "scope": row["scope"], "body": row["body"]} for row in rows]
+
+
+def add_chat_message(role: str, body: str, agent: str, scope: str) -> None:
+    conn = connect_db()
+    try:
+        person = require_user(conn)
+        conn.execute(
+            "INSERT INTO chat (user_id, role, agent, scope, body, at) VALUES (?, ?, ?, ?, ?, ?)",
+            (person["id"], role, agent, scope, body, now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    publish_library()
+
+
+def import_record(kind: str, source: Path) -> dict:
+    """Copy an X-ray or lab file into the config directory and record its path."""
+    if kind not in {"xray", "blood", "urine"}:
+        raise ValueError(f"Unknown record kind: {kind}")
+    source = Path(source)
+    if not source.is_file():
+        raise FileNotFoundError(f"File does not exist: {source}")
+    conn = connect_db()
+    try:
+        person = require_user(conn)
+        folder = (xray_dir() if kind == "xray" else document_dir()) / person["id"]
+        folder.mkdir(parents=True, exist_ok=True)
+        os.chmod(folder, 0o700)
+        safe = "".join(ch if ch.isalnum() or ch in ".-_" else "_" for ch in source.name) or "file"
+        dest = folder / f"{uuid.uuid4().hex[:12]}-{safe}"
+        shutil.copyfile(source, dest)
+        os.chmod(dest, 0o600)
+        record_id = uuid.uuid4().hex
+        added = now_iso()
+        conn.execute(
+            "INSERT INTO files (id, user_id, kind, name, path, added_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (record_id, person["id"], kind, source.name, str(dest), added),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    publish_library()
+    return {"id": record_id, "kind": kind, "name": source.name, "path": str(dest), "addedAt": added}
+
+
+def refresh_day(conn: sqlite3.Connection, user_id: str, day: str) -> None:
+    """Rebuild one person's day from every saved sample so repeats are not added twice."""
+    bucket = DayBucket()
+    found = False
+    for record in conn.execute(
+        "SELECT field, op, value, at FROM samples WHERE user_id = ? AND day = ?",
+        (user_id, day),
+    ):
+        found = True
+        field = record["field"]
+        value = float(record["value"])
+        op = record["op"]
+        if op == "sum":
+            bucket.add_sum(field, value)
+        elif op == "avg":
+            bucket.add_avg(field, value)
+        elif op == "sleep":
+            bucket.add_sleep(value)
+        else:
+            when = datetime.fromisoformat(record["at"]) if record["at"] else datetime.min
+            bucket.add_last(field, when, value)
+    if not found:
+        conn.execute("DELETE FROM days WHERE user_id = ? AND date = ?", (user_id, day))
+        return
+    row = bucket.as_dict(day)
+    names = ", ".join(["user_id", "date", *DAY_FIELDS])
+    marks = ", ".join("?" for _ in range(2 + len(DAY_FIELDS)))
+    assignments = ", ".join(f"{field}=excluded.{field}" for field in DAY_FIELDS)
+    values: list = [user_id, row["date"]]
+    for field in DAY_FIELDS:
+        item = row.get(field)
+        values.append(None if item is None else float(item))
+    conn.execute(
+        f"INSERT INTO days ({names}) VALUES ({marks}) ON CONFLICT(user_id, date) DO UPDATE SET {assignments}",
+        values,
+    )
+
+
+def save_meta(conn: sqlite3.Connection, meta: dict[str, str]) -> None:
+    for key, value in meta.items():
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def merge_export(path: Path) -> tuple[str, str | None]:
+    """Save samples that are new or changed, then rebuild only those days."""
+    conn = connect_db()
+    try:
+        person = require_user(conn)
+        uid = person["id"]
+        labeled = conn.execute(
+            "SELECT value FROM user_meta WHERE user_id = ? AND key = 'labeledSample'",
+            (uid,),
+        ).fetchone()
+        if labeled is not None and labeled["value"] == "1":
+            conn.execute("DELETE FROM days WHERE user_id = ?", (uid,))
+            conn.execute("DELETE FROM samples WHERE user_id = ?", (uid,))
+        conn.execute("DROP TABLE IF EXISTS incoming")
+        conn.execute(
+            """
+            CREATE TEMP TABLE incoming (
+              id TEXT PRIMARY KEY,
+              day TEXT NOT NULL,
+              field TEXT NOT NULL,
+              op TEXT NOT NULL,
+              value REAL NOT NULL,
+              at TEXT NOT NULL
+            )
+            """
+        )
+        batch: list[tuple] = []
+
+        def flush() -> None:
+            if not batch:
+                return
+            conn.executemany(
+                "INSERT OR REPLACE INTO incoming (id, day, field, op, value, at) VALUES (?,?,?,?,?,?)",
+                batch,
+            )
+            batch.clear()
+
+        def emit(sample: dict) -> None:
+            batch.append((
+                sample["id"],
+                sample["day"],
+                sample["field"],
+                sample["op"],
+                float(sample["value"]),
+                sample.get("at") or "",
+            ))
+            if len(batch) >= 4000:
+                flush()
+
+        source, exported_at = load_export(path, emit)
+        flush()
+        touched: set[str] = set()
+        changed = conn.execute(
+            """
+            SELECT i.day AS new_day, s.day AS old_day
+            FROM incoming i
+            LEFT JOIN samples s ON s.user_id = ? AND s.id = i.id
+            WHERE s.id IS NULL
+               OR s.value != i.value
+               OR s.day != i.day
+               OR s.field != i.field
+               OR s.op != i.op
+               OR s.at != i.at
+            """,
+            (uid,),
+        )
+        for record in changed:
+            touched.add(record["new_day"])
+            if record["old_day"]:
+                touched.add(record["old_day"])
+        conn.execute(
+            """
+            INSERT INTO samples (user_id, id, day, field, op, value, at)
+            SELECT ?, id, day, field, op, value, at FROM incoming
+            WHERE true
+            ON CONFLICT(user_id, id) DO UPDATE SET
+              day = excluded.day,
+              field = excluded.field,
+              op = excluded.op,
+              value = excluded.value,
+              at = excluded.at
+            """,
+            (uid,),
+        )
+        for day in touched:
+            refresh_day(conn, uid, day)
+        conn.execute("DROP TABLE IF EXISTS incoming")
+        conn.commit()
+        return source, exported_at
+    finally:
+        conn.close()
+
+
+def publish_saved(rows: list[dict], meta: dict[str, str], apple_id: str) -> int:
+    source = meta.get("source") or "none"
+    detail = meta.get("sourceDetail") or ""
+    labeled = meta.get("labeledSample") == "1"
+    exported_at = meta.get("exportedAt") or None
+    saved_apple = meta.get("appleId") or apple_id
+    if not rows:
+        message = detail or "No saved health data."
+        write_json(index_path(), empty_index(saved_apple, message))
+        write_status("empty", message, labeledSample=labeled, source=source)
+        publish_library()
+        return 0
+    index = build_index(rows, source, detail, labeled, exported_at, saved_apple)
+    write_json(index_path(), index)
+    if labeled:
+        message = "Sample data. These numbers are invented."
+    else:
+        message = f"Opened {len(rows)} days from the local database."
+    write_status("ready", message, labeledSample=labeled, source=source)
+    publish_library()
+    return 0
+
+
+def import_path(path: Path, apple_id: str) -> int:
+    source, exported_at = merge_export(path)
+    uid, _name = current_person()
+    rows, _meta = load_days()
+    detail = "" if rows else "That file had none of the activity or vitals OHealth charts."
+    conn = connect_db()
+    try:
+        save_user_meta(conn, uid, {
+            "stored": "1",
+            "source": source,
+            "sourceDetail": detail,
+            "labeledSample": "0",
+            "exportedAt": exported_at or "",
+            "appleId": apple_id or "",
+        })
+        conn.commit()
+    finally:
+        conn.close()
+    if not rows:
+        write_json(index_path(), empty_index(apple_id, detail))
+        write_status("empty", detail, source=source)
+        publish_library()
+        return 0
+    rows, meta = load_days()
+    return publish_saved(rows, meta, apple_id)
+
+
+def run(
+    sample: bool,
+    export: str | None,
+    sample_end: str | None,
+    pick: bool = False,
+    inbox: bool = False,
+    select_database: bool = False,
+    database: str | None = None,
+    record_kind: str | None = None,
+    record_file: str | None = None,
+    add_person: str | None = None,
+    select_person: str | None = None,
+    list_people: bool = False,
+) -> int:
     ensure_layout()
+    if record_kind:
+        titles = {"xray": "Import X-ray", "blood": "Import blood test", "urine": "Import urine test"}
+        if record_kind not in titles:
+            print(f"Unknown record kind: {record_kind}", file=sys.stderr)
+            return 1
+        if not record_file:
+            extensions = "png jpg jpeg webp tif tiff gif" if record_kind == "xray" else "pdf png jpg jpeg webp tif tiff txt"
+            try:
+                record_file = choose_file(titles[record_kind], extensions)
+            except RuntimeError as exc:
+                write_status("error", str(exc))
+                print(exc, file=sys.stderr)
+                return 1
+            if not record_file:
+                return 3
+    if select_database:
+        try:
+            database = choose_database()
+        except RuntimeError as exc:
+            write_status("error", str(exc))
+            print(exc, file=sys.stderr)
+            return 1
+        if not database:
+            return 3
+    if pick:
+        try:
+            export = choose_export()
+        except RuntimeError as exc:
+            write_status("error", str(exc))
+            print(exc, file=sys.stderr)
+            return 1
+        if not export:
+            return 3
     cfg = read_config()
     apple_id = cfg.get("APPLE_ID", "")
-    write_status("syncing", "Reading health data…", labeledSample=sample)
     try:
+        if database:
+            set_selected_database(Path(database))
+        if add_person:
+            add_user(add_person)
+        if select_person:
+            set_current_user(select_person)
+        if (list_people or add_person) and not select_person and not sample and not export and not inbox and not record_kind:
+            if list_people and not add_person:
+                publish_users()
+            return 0
+        if record_kind:
+            saved = import_record(record_kind, Path(record_file or ""))
+            write_status("ready", f"Saved {saved['name']}.", source="files")
+            return 0
         if sample:
             end = date.fromisoformat(sample_end) if sample_end else date.today()
             rows = build_sample_rows(400, end)
-            index = build_index(
-                rows,
-                "sample",
-                "Invented preview series so the window can be used before an Apple Health export is available. Not a record of anyone's health.",
-                True,
-                None,
-                apple_id,
+            detail = (
+                "Invented preview series so the window can be used before an Apple Health "
+                "export is available. Not a record of anyone's health."
             )
+            store_days(
+                rows,
+                source="sample",
+                source_detail=detail,
+                labeled_sample=True,
+                exported_at=None,
+                apple_id=apple_id,
+            )
+            index = build_index(rows, "sample", detail, True, None, apple_id)
             write_json(index_path(), index)
             write_status("ready", "Sample data. These numbers are invented.", labeledSample=True, source="sample")
+            publish_library()
             return 0
-        path = find_input(export or cfg.get("EXPORT") or None)
-        if path is None:
-            detail = (
-                "No Health export in the inbox. Apple does not offer a HealthKit cloud API. "
-                "Export All Health Data on the iPhone and put export.zip in the inbox."
-            )
-            write_json(index_path(), empty_index(apple_id, detail))
-            write_status("empty", detail, source="none")
+        if export or inbox:
+            write_status("syncing", "Importing…", labeledSample=False)
+            if export:
+                path = find_input(export)
+            else:
+                path = find_input(None)
+            if path is None:
+                write_json(index_path(), empty_index(apple_id, EMPTY_DETAIL))
+                write_status("empty", EMPTY_DETAIL, source="none")
+                publish_library()
+                return 0
+            return import_path(path, apple_id)
+        write_status("syncing", "Opening saved health data…", labeledSample=False)
+        rows, meta = load_days()
+        if not meta.get("user"):
+            message = "Choose a person to open this database."
+            write_json(index_path(), empty_index(apple_id, message))
+            write_status("choose", message, source="none")
+            publish_library()
             return 0
-        rows, source, exported_at = load_export(path)
-        if not rows:
-            detail = f"Read {path.name}, but it had none of the activity or vitals OHealth charts."
-            write_json(index_path(), empty_index(apple_id, detail))
-            write_status("empty", detail, source=source)
+        if meta.get("stored") != "1":
+            write_json(index_path(), empty_index(apple_id, EMPTY_DETAIL))
+            write_status("empty", EMPTY_DETAIL, source="none")
+            publish_library()
             return 0
-        detail = str(path)
-        index = build_index(rows, source, detail, False, exported_at, apple_id)
-        write_json(index_path(), index)
-        write_status(
-            "ready",
-            f"Indexed {len(rows)} days from {path.name}.",
-            labeledSample=False,
-            source=source,
-        )
-        return 0
+        return publish_saved(rows, meta, apple_id)
     except Exception as exc:  # noqa: BLE001 — surface a single error string to the window
         message = str(exc) or exc.__class__.__name__
         write_status("error", message)
@@ -673,10 +1667,35 @@ def run(sample: bool, export: str | None, sample_end: str | None) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build the OHealth index")
     parser.add_argument("--sample", action="store_true", help="write invented, labeled sample data")
-    parser.add_argument("--export", help="export.zip, export.xml, JSON, or a directory of them")
+    parser.add_argument("--export", help="read this export once and save it in the local database")
+    parser.add_argument("--inbox", action="store_true", help="read the inbox once and save it in the local database")
+    parser.add_argument("--pick", action="store_true", help="choose an export with the file manager, then save it")
+    parser.add_argument("--select-database", action="store_true", help="choose the sqlite database, then open it")
+    parser.add_argument("--database", help="save this database path in the OHealth database and open it")
+    parser.add_argument("--xray", action="store_true", help="import an X-ray into the database")
+    parser.add_argument("--blood", action="store_true", help="import a blood test into the database")
+    parser.add_argument("--urine", action="store_true", help="import a urine test into the database")
+    parser.add_argument("--file", help="file to import with --xray, --blood, or --urine")
     parser.add_argument("--sample-end", help="ISO date the sample series ends on (tests)")
+    parser.add_argument("--users", action="store_true", help="write the people in this database")
+    parser.add_argument("--add-user", help="add a person to this database")
+    parser.add_argument("--user", help="open the database as this person")
     args = parser.parse_args()
-    sys.exit(run(args.sample, args.export, args.sample_end))
+    kind = "xray" if args.xray else "blood" if args.blood else "urine" if args.urine else None
+    sys.exit(run(
+        args.sample,
+        args.export,
+        args.sample_end,
+        args.pick,
+        args.inbox,
+        args.select_database,
+        args.database,
+        kind,
+        args.file,
+        args.add_user,
+        args.user,
+        args.users,
+    ))
 
 
 if __name__ == "__main__":

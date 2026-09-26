@@ -1,5 +1,5 @@
 [Unit]
-Description=Index an Apple Health export for OHealth
+Description=Publish the local OHealth database
 
 [Service]
 Type=oneshot

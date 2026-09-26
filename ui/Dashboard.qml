@@ -18,17 +18,37 @@ Item {
   property bool sample: false
   property string agentLabel: "No agent chosen"
   property bool agentInstalled: false
+  property string gallery: ""
+  property var xrays: []
+  property var blood: []
+  property var urine: []
+  property string focusId: ""
 
   signal rangeChosen(int index)
   signal metricChosen(int index)
   signal dayChosen(int index)
   signal zoneChosen(string name)
+  signal sectionChosen(string name)
+  signal documentChosen(string id, string kind)
+  signal galleryClosed()
 
   readonly property var metrics: (view && view.metrics) ? view.metrics : []
   readonly property var summary: (view && view.summary) ? view.summary : []
   readonly property var days: (view && view.days) ? view.days : []
   readonly property var metric: (metricIndex >= 0 && metricIndex < metrics.length) ? metrics[metricIndex] : null
   readonly property var series: (metric && metric.series) ? metric.series : []
+
+  function hasActivity() {
+    for (var i = 0; i < metrics.length; i++)
+      if (metrics[i].group === "activity") return true
+    return false
+  }
+
+  function activityEnds(index) {
+    if (index < 0 || index >= metrics.length) return false
+    if (metrics[index].group !== "activity") return false
+    return index === metrics.length - 1 || metrics[index + 1].group !== "activity"
+  }
 
   function dayName(iso) {
     if (!iso) return ""
@@ -229,6 +249,11 @@ Item {
           id: metricCol
           width: parent.width
           spacing: 2
+
+          DocumentSection {
+            visible: !root.hasActivity()
+          }
+
           Repeater {
             model: root.metrics
             delegate: Column {
@@ -289,6 +314,10 @@ Item {
                   }
                 }
               }
+
+              DocumentSection {
+                visible: root.activityEnds(index)
+              }
             }
           }
         }
@@ -304,8 +333,20 @@ Item {
       border.width: root.zone === "days" ? 2 : 1
       border.color: root.zone === "days" ? theme.accent : theme.lighterBackground
 
+      Gallery {
+        anchors.fill: parent
+        visible: root.gallery !== ""
+        theme: root.theme
+        title: root.gallery === "xrays" ? "X-Rays" : "Blood and Urine Tests"
+        files: root.gallery === "xrays" ? root.xrays : root.blood.concat(root.urine)
+        focusId: root.focusId
+        onFocusChosen: (id, kind) => root.documentChosen(id, kind)
+        onCloseRequested: root.galleryClosed()
+      }
+
       Column {
         id: chartHead
+        visible: root.gallery === ""
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
@@ -359,7 +400,7 @@ Item {
         anchors.leftMargin: 14
         anchors.rightMargin: 14
         anchors.topMargin: 8
-        visible: root.state === "ready" && root.series.length > 0
+        visible: root.gallery === "" && root.state === "ready" && root.series.length > 0
 
           Flickable {
             id: chartFlick
@@ -416,6 +457,7 @@ Item {
 
       Column {
         id: chartFoot
+        visible: root.gallery === ""
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
@@ -474,7 +516,7 @@ Item {
           width: parent.width
           wrapMode: Text.Wrap
           text: {
-            if (root.state === "loading") return "Reading the health export…"
+            if (root.state === "loading") return "Opening saved health data…"
             if (root.state === "empty") return root.stateMessage.length > 0 ? root.stateMessage : "No days to chart yet."
             if (root.state === "error" && !(root.metric && root.days.length > 0))
               return "The last read failed before any days were indexed."
@@ -483,6 +525,54 @@ Item {
           color: root.state === "error" ? theme.red : theme.foreground
           font.family: theme.fontFamily
           font.pixelSize: theme.fontSize
+        }
+      }
+    }
+  }
+
+  component DocumentSection: Column {
+    width: metricCol.width
+    spacing: 2
+
+    Text {
+      text: "Documents"
+      color: theme.accent
+      font.family: theme.fontFamily
+      font.pixelSize: theme.fontSize - 1
+      font.bold: true
+      topPadding: 12
+      leftPadding: 8
+    }
+
+    Repeater {
+      model: [
+        { id: "xrays", label: "X-Rays" },
+        { id: "labs", label: "Blood and Urine Tests" }
+      ]
+      delegate: Rectangle {
+        required property var modelData
+        width: parent.width
+        height: 34
+        radius: 4
+        color: root.gallery === modelData.id ? theme.selection : "transparent"
+        border.width: root.gallery === modelData.id ? 1 : 0
+        border.color: theme.accent
+        Text {
+          anchors.fill: parent
+          anchors.leftMargin: 8
+          anchors.rightMargin: 8
+          verticalAlignment: Text.AlignVCenter
+          elide: Text.ElideRight
+          text: modelData.label
+          color: root.gallery === modelData.id ? theme.brightForeground : theme.foreground
+          font.family: theme.fontFamily
+          font.pixelSize: theme.fontSize
+          font.bold: root.gallery === modelData.id
+        }
+        MouseArea {
+          anchors.fill: parent
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.sectionChosen(modelData.id)
         }
       }
     }

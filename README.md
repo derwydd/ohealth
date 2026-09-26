@@ -2,7 +2,7 @@
 
 Activity, vitals, and trends in a keyboard-driven window for [Omarchy](https://omarchy.org). The UI is Quickshell QML. It follows the active Omarchy theme and asks Omarchy's chosen system agent about the metric you are looking at.
 
-This is not Apple's Health app, and it does not talk to HealthKit. HealthKit is an on-device framework. Apple does not publish a HealthKit cloud API, and the iCloud session used here cannot read health records. The numbers on screen come from a file you export on an iPhone, or from a labeled sample series when you have no export yet.
+This is not Apple's Health app, and it does not talk to HealthKit. HealthKit is an on-device framework, and Apple does not publish a HealthKit cloud API. The numbers on screen come from a file you export on an iPhone, or from a labeled sample series when you have no export yet.
 
 ## Run
 
@@ -17,39 +17,31 @@ sudo pacman -S quickshell
 /Users/derwydd/Documents/projects/rsx/repos/ohealth/bin/ohealth
 ```
 
-The same command with `--sample` skips sign-in and loads invented numbers. The window says they are sample data.
+The same command with `--sample` loads invented numbers. The window says they are sample data.
 
 ```bash
 /Users/derwydd/Documents/projects/rsx/repos/ohealth/bin/ohealth --sample
 ```
 
-`install.sh` symlinks those commands into `~/.local/bin`, writes a desktop entry, creates a virtualenv, and tries to `pip install pyicloud` for Apple sign-in. On Omarchy it also enables a user timer that re-reads the inbox every 30 minutes. It does not need root after `quickshell` itself is installed.
+`install.sh` symlinks those commands into `~/.local/bin` and writes a desktop entry. On Omarchy it also enables a user timer that republishes the local database every 30 minutes. It does not need root after `quickshell` itself is installed.
 
 ## How health data gets here
 
 1. On the iPhone, open Health, tap your picture, and choose **Export All Health Data**. That produces `export.zip`.
-2. Put `export.zip` or the `export.xml` inside it in the inbox:
+2. Choose it with **File → Import from Apple HealthKit Export**. That reads the file once and stores new records in `~/.config/ohealth/ohealth.sqlite`. Opening the window reads that database. Importing the same file again adds only records that are not already saved.
+
+   Or put `export.zip` in the inbox and run `ohealth-sync --inbox`:
 
    `~/.local/share/ohealth/inbox`
 
-   Or set `EXPORT=` in `~/.config/ohealth/config` to a file or a directory.
-3. Press `r` in the window, or run `ohealth-sync`.
+   `ohealth-sync --export PATH` saves a file the same way.
+3. Press `r` to reload the saved database.
 
-A directory of [Health Auto Export](https://www.healthexportapp.com) JSON is accepted too. The sync script writes `~/.cache/ohealth/index.json` and `status.json`. The window watches both.
+A directory of [Health Auto Export](https://www.healthexportapp.com) JSON is accepted too. After an import, the sync script publishes `~/.cache/ohealth/index.json` and `status.json` from the database. The window watches both.
 
 What that covers: steps, active energy, exercise minutes, walking and running distance, sleep, heart rate, resting heart rate, heart-rate variability, blood oxygen, respiratory rate, and weight. Other Health types are ignored.
 
-`ohealth --sample` does not read an export and does not call Apple. The index is marked `labeledSample`.
-
-## Apple sign-in
-
-Sign-in matches [Omarchy iCloud Photos](https://github.com/jankeesvw/omarchy-icloud-photos). The window collects the Apple ID, the password, and the six-digit code. `bin/ohealth_helper.py` sends them to pyicloud (or `pyicloud_ipd`, the module icloudpd vendors) on stdin. The password is not written to disk. The session cookies go to `~/.config/icloudpd`, the same jar iCloud Photos and `icloudpd` use, unless `COOKIES=` says otherwise.
-
-That session proves the Apple ID and is there so this app sits on the same auth bridge as iCloud Photos. It is not a HealthKit download. After you are signed in, the window still needs the export in the inbox. If the session expires, the sign-in card comes back. `shift+r` checks the session once.
-
-Current pyicloud refuses the session until Apple's updated terms are accepted. Sign-in passes the library's `accept_terms` flag, the same switch as `icloud auth login --accept-terms`. Older pyicloud builds ignore that flag; if Apple still blocks the account, accept the terms at icloud.com and sign in again.
-
-This checkout already has a `.venv` with pyicloud installed, and the helper scripts use it when it is present. `install.sh` creates that virtualenv if it is missing. If the import fails, the card says sign-in is unavailable. Sample data and a local export still load.
+`ohealth --sample` does not read an export. The index is marked `labeledSample`.
 
 ## Theme
 
@@ -85,38 +77,33 @@ Press `?` in the window for the same list.
 | `page up` `page down` | Move further |
 | `enter` | Ask the Omarchy agent about the focused metric |
 | In the agent region, `j` `k` | Change the saved Omarchy default |
+| `?` | Open the keyboard reference |
 | `a` | Open the full agent list |
 | `enter` in the list | Save that agent |
 | `o` in the list | Open Omarchy's agent menu, when the shell is installed |
-| `r` | Read the Health export again |
-| `shift+r` | Check the Apple session |
+| `r` | Reload the saved health data |
 | `ctrl+p` | Preview invented sample data |
-| `?` | This list |
-| `esc` | Close the list or the key map, or quit |
+| `esc` | Close the keyboard window, the picker, or quit |
 | `q` | Quit |
 
-On the sign-in card, `tab` moves through the fields, `enter` submits, `esc` quits, and `ctrl+p` opens the sample preview. The mouse works everywhere. Nothing requires it.
+The mouse works everywhere. Nothing requires it.
 
 ## Layout
 
 ```
 bin/ohealth                 quickshell -p ui/shell.qml [--sample]
-bin/ohealth-sync            export or sample → index.json
-bin/ohealth-helper          login, status, probe, logout
+bin/ohealth-sync            database, import, or sample → index.json
 bin/ohealth-agent           list, set, ask the Omarchy default
 bin/ohealth_sync.py         Apple Health XML/zip and Health Auto Export JSON
-bin/ohealth_helper.py       pyicloud sign-in, password on stdin only
 bin/ohealth_agent.py        ~/.config/omarchy/defaults/agent
-ui/shell.qml                window, keys, sign-in, agent, theme watchers
+ui/shell.qml                window, keys, agent, theme watchers
 ui/Theme.qml                colors.toml and shell.toml
-ui/Login.qml                Apple ID, password, two-factor code
 ui/Dashboard.qml            summary, activity, vitals, trend
+ui/Settings.qml             local database path
 ui/AgentPicker.qml          Omarchy's agent list
 ui/Help.qml                 key map
 systemd/                    optional 30 minute re-index
 ```
-
-`ohealth-helper logout` removes `APPLE_ID` from this app's config and leaves the shared cookie jar in place.
 
 ## Tests
 
@@ -128,4 +115,4 @@ The tests use a temporary home. They do not read your iCloud cookies or your Oma
 
 ## What still needs an Apple device
 
-An Apple ID can sign in from this window once pyicloud is installed. The health records themselves still have to be exported on an iPhone (or produced by Health Auto Export) and placed in the inbox. There is no step in this app that fetches HealthKit from iCloud, because that API is not available.
+The health records have to be exported on an iPhone (or produced by Health Auto Export) and placed in the inbox. There is no step in this app that fetches HealthKit from iCloud, because that API is not available.

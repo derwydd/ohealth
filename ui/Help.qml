@@ -1,13 +1,21 @@
 import QtQuick
 
-// Keyboard reference. Closes on ?, Esc, or q.
-Rectangle {
+// Keyboard reference. Shown in its own window. Closes on Esc, q, or Close.
+Item {
   id: root
 
   required property var theme
   signal requestClose()
 
-  color: Qt.rgba(0, 0, 0, 0.62)
+  focus: true
+  Keys.onEscapePressed: root.requestClose()
+  Keys.onPressed: event => {
+    if (event.text === "q" || event.text === "?") {
+      root.requestClose()
+      event.accepted = true
+    }
+  }
+  Component.onCompleted: forceActiveFocus()
 
   readonly property var sections: [
     { title: "Move", keys: [
@@ -27,11 +35,12 @@ Rectangle {
       ["a", "open the full agent list"],
       ["enter in the picker", "save that agent as the Omarchy default"],
       ["o in the picker", "open Omarchy's own agent menu, when the shell is installed"],
-      ["r", "read the Health export again"],
-      ["shift+r", "check the Apple session"],
+      ["r", "reload the saved health data"],
+      ["file menu", "Settings, keyboard, switch person, import health data, X-rays, or lab tests"],
+      ["opening the app", "choose a person. Import asks you to confirm that person"],
       ["ctrl+p", "preview invented sample data"],
-      ["?", "this list"],
-      ["esc", "close this, or the picker, or quit"],
+      ["?", "open this window"],
+      ["esc", "close this window, or the picker, or quit"],
       ["q", "quit"]
     ]},
     { title: "Regions", keys: [
@@ -42,24 +51,14 @@ Rectangle {
     ]}
   ]
 
-  MouseArea {
-    anchors.fill: parent
-    onClicked: root.requestClose()
-  }
-
   Rectangle {
-    anchors.centerIn: parent
-    width: Math.min(body.implicitWidth + 64, root.width - 32)
-    height: Math.min(body.implicitHeight + 56, root.height - 32)
-    radius: 12
-    color: theme.darkBackground
-    border.color: theme.lighterBackground
-    border.width: 1
-    MouseArea { anchors.fill: parent }
+    anchors.fill: parent
+    color: theme.background
 
     Flickable {
       anchors.fill: parent
       anchors.margins: 28
+      anchors.bottomMargin: 72
       contentWidth: width
       contentHeight: body.implicitHeight
       clip: true
@@ -70,7 +69,7 @@ Rectangle {
         width: parent.width
         spacing: 18
         Text {
-          text: "Keys"
+          text: "Keyboard"
           color: theme.brightForeground
           font.family: theme.fontFamily
           font.pixelSize: 18
@@ -122,6 +121,33 @@ Rectangle {
             }
           }
         }
+      }
+    }
+
+    Rectangle {
+      anchors.left: parent.left
+      anchors.bottom: parent.bottom
+      anchors.leftMargin: 28
+      anchors.bottomMargin: 20
+      width: closeLabel.implicitWidth + 28
+      height: 34
+      radius: 6
+      color: closeArea.containsMouse ? Qt.lighter(theme.accent, 1.12) : theme.accent
+      Text {
+        id: closeLabel
+        anchors.centerIn: parent
+        text: "Close"
+        color: theme.darkerBackground
+        font.family: theme.fontFamily
+        font.pixelSize: theme.fontSize
+        font.bold: true
+      }
+      MouseArea {
+        id: closeArea
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.requestClose()
       }
     }
   }

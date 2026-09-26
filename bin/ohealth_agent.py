@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -181,12 +182,17 @@ def argv_for(agent_id: str, prompt: str) -> list[str]:
     return commands[agent_id]
 
 
-def cmd_ask(dry_run: bool) -> None:
-    raw = sys.stdin.read()
+def read_payload(what: str) -> dict:
+    """One JSON line. The window writes the line and leaves the pipe open."""
+    raw = sys.stdin.readline()
     try:
-        payload = json.loads(raw) if raw.strip() else {}
+        return json.loads(raw) if raw.strip() else {}
     except json.JSONDecodeError as exc:
-        fail(f"The health slice was not JSON: {exc}")
+        fail(f"The {what} was not JSON: {exc}")
+
+
+def cmd_ask(dry_run: bool) -> None:
+    payload = read_payload("health slice")
     selected = read_selected()
     if not selected:
         fail("No Omarchy agent is chosen. Pick one in OHealth, or run omarchy-default-agent.")
@@ -236,6 +242,156 @@ def cmd_ask(dry_run: bool) -> None:
     })
 
 
+def reply_argv(agent_id: str, prompt_path: Path, prompt: str) -> list[str]:
+    """Run one turn and print the answer on stdout.
+
+    omarchy-agent without --inline opens a terminal, so the sidebar never
+    sees the reply. Headless flags keep the answer in this process.
+    """
+    if agent_id == "grok":
+        return [
+            "grok",
+            "--prompt-file",
+            str(prompt_path),
+            "--permission-mode",
+            "bypassPermissions",
+            "--output-format",
+            "plain",
+        ]
+    if agent_id == "claude":
+        return ["claude", "-p", "--permission-mode", "auto", "--", prompt]
+    if command_exists("omarchy-agent"):
+        return ["omarchy-agent", "--inline", "--prompt", prompt]
+    return argv_for(agent_id, prompt)
+
+
+def build_chat_prompt(payload: dict, agent_id: str, scope: str) -> str:
+    """Tell the agent where the database is and to read it for this message."""
+    from ohealth_sync import DAY_FIELDS, current_person, list_files, load_chat, selected_db_path
+
+    database = str(selected_db_path())
+    user_id, user_name = current_person()
+    lines = [
+        "You are answering in OHealth. This is not medical advice.",
+        "Do not invent measurements, image findings, or lab values.",
+        "",
+        f"The health database is sqlite at:\n  {database}",
+        f"The current person is {user_name} (user_id {user_id}).",
+        "Read that database yourself to answer the user's instruction.",
+        "Only read rows with that user_id. Do not read anyone else's days, samples, files, or chat.",
+        "You can query it with sqlite3. Tables:",
+        "  users(id, name, created_at)",
+        f"  days(user_id, date, {', '.join(DAY_FIELDS)})",
+        "  samples(user_id, id, day, field, op, value, at)",
+        "  files(id, user_id, kind, name, path, added_at)",
+        "kind is xray, blood, or urine. Open the file at path when the user asks you to review an X-ray or a lab result.",
+        "",
+    ]
+    if payload.get("sample"):
+        lines.append(
+            "IMPORTANT: the numbers in this database are invented sample data. "
+            "They are not a record of anyone's health. Say that in the first sentence."
+        )
+        lines.append("")
+    if scope == "all":
+        lines.append("Scope: this person's whole database. Do not stop at the day on screen, and do not read another user_id.")
+    else:
+        lines.append("Scope: start with the selection below, then read the database if the instruction needs more.")
+        if payload.get("range"):
+            lines.append(f"Range: {payload.get('range')}")
+        if payload.get("metric"):
+            lines.append(f"Metric: {payload.get('metric')}")
+        if payload.get("day"):
+            lines.append(f"Selected day: {payload.get('day')} = {payload.get('dayValue') or '—'}")
+        if payload.get("trend"):
+            lines.append(f"Trend already computed: {payload.get('trend')}")
+    focus = payload.get("focusId") or ""
+    files = list_files()
+    lines.append("")
+    lines.append("Files referenced by the database:")
+    if not files:
+        lines.append("  (none imported)")
+    for item in files:
+        mark = "  selected " if item["id"] == focus else "  "
+        lines.append(f"{mark}{item['kind']}: {item['name']} -> {item['path']}")
+    history = load_chat(8)
+    if history:
+        lines.append("")
+        lines.append("Recent conversation:")
+        for turn in history:
+            who = "User" if turn["role"] == "user" else turn.get("agent") or "Agent"
+            lines.append(f"{who}: {turn['body']}")
+    lines.append("")
+    lines.append("Instruction:")
+    lines.append(str(payload.get("message") or "").strip())
+    lines.append("")
+    lines.append(f"Reply as {agent_id}. Quote the database or the file when you use a number or a finding.")
+    return "\n".join(lines).strip() + "\n"
+
+
+def cmd_chat(dry_run: bool) -> None:
+    from ohealth_sync import add_chat_message, current_person
+
+    if not current_person()[0]:
+        fail("Choose a person in OHealth before asking.")
+    payload = read_payload("message")
+    message = str(payload.get("message") or "").strip()
+    if not message:
+        fail("Write a message first.")
+    selected = read_selected()
+    if not selected:
+        fail("No Omarchy agent is chosen. Pick one in OHealth, or run omarchy-default-agent.")
+    scope = "all" if payload.get("scope") == "all" else "selected"
+    if not dry_run:
+        add_chat_message("user", message, selected, scope)
+    prompt = build_chat_prompt(payload, selected, scope)
+    prompt_path = cache_dir() / "chat-prompt.txt"
+    cache_dir().mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(prompt, encoding="utf-8")
+    os.chmod(prompt_path, 0o600)
+    argv = reply_argv(selected, prompt_path, prompt)
+    if dry_run:
+        emit({
+            "ok": True,
+            "dryRun": True,
+            "agent": selected,
+            "argv": argv,
+            "prompt": prompt,
+        })
+        return
+    binary = argv[0]
+    if not command_exists(binary):
+        fail(
+            f"{selected} is not installed. The choice is saved in {agent_file()}. "
+            "On Omarchy, `omarchy default agent " + selected + "` installs it and then launches it."
+        )
+    log_path = cache_dir() / "agent-ask.log"
+    from ohealth_paths import home
+    proc = subprocess.run(
+        argv,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        cwd=str(home()),
+    )
+    reply = (proc.stdout or "").strip()
+    if not reply:
+        reply = (proc.stderr or "").strip() or f"The agent exited ({proc.returncode}) without a reply."
+    reply = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", reply).strip()
+    if len(reply) > 20000:
+        reply = reply[:20000] + "\n…"
+    add_chat_message("agent", reply, selected, scope)
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(f"\n--- {selected} ---\n{reply}\n")
+    emit({
+        "ok": True,
+        "agent": selected,
+        "reply": reply,
+        "log": str(log_path),
+        "viaOmarchy": binary == "omarchy-agent",
+    })
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="OHealth Omarchy agent picker")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -245,6 +401,8 @@ def main() -> None:
     set_cmd.add_argument("agent_id")
     ask = sub.add_parser("ask")
     ask.add_argument("--dry-run", action="store_true")
+    chat = sub.add_parser("chat")
+    chat.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.cmd == "list":
         emit(list_payload())
@@ -252,6 +410,8 @@ def main() -> None:
         emit({"ok": True, "selected": read_selected(), "agentFile": str(agent_file())})
     elif args.cmd == "set":
         cmd_set(args.agent_id)
+    elif args.cmd == "chat":
+        cmd_chat(args.dry_run)
     else:
         cmd_ask(args.dry_run)
 

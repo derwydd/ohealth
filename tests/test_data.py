@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Data-layer checks for sync, Apple-helper status, and the agent picker.
+"""Data-layer checks for sync and the agent picker.
 
-Uses a temporary home. Does not read or write the real iCloud cookie jar
-or ~/.config/omarchy/defaults/agent.
+Uses a temporary home. Does not read or write ~/.config/omarchy/defaults/agent.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import zipfile
@@ -51,8 +51,19 @@ def load_index(env: dict[str, str]) -> dict:
     return json.loads(path.read_text())
 
 
+def enter_person(env: dict[str, str], name: str = "Alex") -> str:
+    added = run(env, "ohealth_sync.py", ["--add-user", name])
+    assert added.returncode == 0, added.stderr
+    users = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "users.json").read_text())
+    match = next(item for item in users["users"] if item["name"] == name)
+    chosen = run(env, "ohealth_sync.py", ["--user", match["id"]])
+    assert chosen.returncode == 0, chosen.stderr
+    return match["id"]
+
+
 def test_sample_is_labeled_and_ranged(tmp: Path) -> None:
     env = isolate(tmp)
+    enter_person(env)
     result = run(env, "ohealth_sync.py", ["--sample", "--sample-end", "2026-09-25"])
     assert result.returncode == 0, result.stderr
     index = load_index(env)
@@ -76,13 +87,20 @@ def test_sample_is_labeled_and_ranged(tmp: Path) -> None:
     assert any(value is None for value in hrv["series"])
     summary_ids = [tile["id"] for tile in window["summary"]]
     assert summary_ids == ["steps", "sleepHours", "restingHr", "hrv"]
-    status = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "status.json").read_text())
-    assert status["state"] == "ready"
-    assert status["labeledSample"] is True
+    again = run(env, "ohealth_sync.py", [])
+    assert again.returncode == 0, again.stderr
+    reloaded = load_index(env)
+    assert reloaded["labeledSample"] is True
+    assert reloaded["source"] == "sample"
+    assert reloaded["ranges"]["7d"]["days"][-1] == "2026-09-25"
+    database = Path(env["XDG_CONFIG_HOME"]) / "ohealth" / "ohealth.sqlite"
+    assert database.is_file()
+    assert database.stat().st_mode & 0o777 == 0o600
 
 
 def test_apple_export_xml_and_units(tmp: Path) -> None:
     env = isolate(tmp)
+    enter_person(env)
     xml = tmp / "export.xml"
     xml.write_text(
         """<?xml version="1.0" encoding="UTF-8"?>
@@ -126,6 +144,7 @@ def test_apple_export_xml_and_units(tmp: Path) -> None:
 
 def test_export_zip_and_empty_inbox(tmp: Path) -> None:
     env = isolate(tmp)
+    enter_person(env)
     xml = tmp / "export.xml"
     xml.write_text(
         """<?xml version="1.0" encoding="UTF-8"?>
@@ -143,10 +162,41 @@ def test_export_zip_and_empty_inbox(tmp: Path) -> None:
     index = load_index(env)
     resting = next(item for item in index["ranges"]["30d"]["metrics"] if item["id"] == "restingHr")
     assert resting["series"] == [55]
+    config = (Path(env["XDG_CONFIG_HOME"]) / "ohealth" / "config").read_text()
+    assert f"EXPORT={archive}" not in config
+    xml.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <Record type="HKQuantityTypeIdentifierRestingHeartRate" unit="count/min" startDate="2026-09-01 06:00:00 +0000" endDate="2026-09-01 06:00:00 +0000" value="99"/>
+</HealthData>
+"""
+    )
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.write(xml, "apple_health_export/export.xml")
+    again = run(env, "ohealth_sync.py", [])
+    assert again.returncode == 0, again.stderr
+    remembered = load_index(env)
+    resting = next(item for item in remembered["ranges"]["30d"]["metrics"] if item["id"] == "restingHr")
+    assert resting["series"] == [55]
+    archive.unlink()
+    kept = run(env, "ohealth_sync.py", [])
+    assert kept.returncode == 0, kept.stderr
+    remembered = load_index(env)
+    resting = next(item for item in remembered["ranges"]["30d"]["metrics"] if item["id"] == "restingHr")
+    assert resting["series"] == [55]
+    database = Path(env["XDG_CONFIG_HOME"]) / "ohealth" / "ohealth.sqlite"
+    assert database.is_file()
+    status = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "status.json").read_text())
+    assert status["state"] == "ready"
+    assert "local database" in status["message"]
 
     env2 = isolate(tmp / "empty")
     result = run(env2, "ohealth_sync.py", [])
     assert result.returncode == 0, result.stderr
+    status = json.loads((Path(env2["XDG_CACHE_HOME"]) / "ohealth" / "status.json").read_text())
+    assert status["state"] == "choose"
+    assert "person" in status["message"].lower()
+    enter_person(env2, "Blake")
     status = json.loads((Path(env2["XDG_CACHE_HOME"]) / "ohealth" / "status.json").read_text())
     assert status["state"] == "empty"
     assert "HealthKit" in status["message"]
@@ -154,8 +204,65 @@ def test_export_zip_and_empty_inbox(tmp: Path) -> None:
     assert index["ranges"]["30d"]["dayCount"] == 0
 
 
+def test_pick_uses_the_file_the_chooser_prints(tmp: Path) -> None:
+    env = isolate(tmp)
+    enter_person(env)
+    xml = tmp / "export.xml"
+    xml.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" startDate="2026-09-24 08:00:00 -0500" endDate="2026-09-24 09:00:00 -0500" value="42"/>
+</HealthData>
+"""
+    )
+    bindir = tmp / "bin"
+    bindir.mkdir()
+    chooser = bindir / "omarchy-file-select"
+    chooser.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(str(xml)) + "\n")
+    chooser.chmod(0o755)
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+
+    picked = run(env, "ohealth_sync.py", ["--pick"])
+    assert picked.returncode == 0, picked.stderr
+    index = load_index(env)
+    steps = next(item for item in index["ranges"]["7d"]["metrics"] if item["id"] == "steps")
+    assert steps["series"] == [42]
+    again = run(env, "ohealth_sync.py", [])
+    assert again.returncode == 0, again.stderr
+    reloaded = load_index(env)
+    steps = next(item for item in reloaded["ranges"]["7d"]["metrics"] if item["id"] == "steps")
+    assert steps["series"] == [42]
+
+    chooser.write_text("#!/bin/sh\nexit 1\n")
+    cancelled = run(env, "ohealth_sync.py", ["--pick"])
+    assert cancelled.returncode == 3, cancelled.stderr
+    kept = load_index(env)
+    steps = next(item for item in kept["ranges"]["7d"]["metrics"] if item["id"] == "steps")
+    assert steps["series"] == [42]
+
+
+def test_chooser_window_is_the_new_file_dialog(tmp: Path) -> None:
+    sys.path.insert(0, str(BIN))
+    import ohealth_sync
+
+    before = {"0x1", "0x2"}
+    clients = [
+        {"address": "0x1", "title": "OHealth", "class": "org.quickshell"},
+        {"address": "0x2", "title": "Notes", "class": "io.github.lgse.Strata"},
+        {"address": "0x3", "title": "Choose a file", "class": "io.github.lgse.Strata.FileChooser"},
+    ]
+    found = ohealth_sync.chooser_client(clients, before, "Open Apple Health export")
+    assert found is not None and found["address"] == "0x3"
+    titled = dict(clients[2], title="Open Apple Health export", **{"class": "gtk"})
+    assert ohealth_sync.chooser_client([clients[0], titled], before, "Open Apple Health export")["address"] == "0x3"
+    assert ohealth_sync.chooser_client(clients, {"0x1", "0x2", "0x3"}, "Open Apple Health export") is None
+    app = ohealth_sync.app_window(clients)
+    assert app is not None and app["address"] == "0x1"
+
+
 def test_health_auto_export_json(tmp: Path) -> None:
     env = isolate(tmp)
+    enter_person(env)
     payload = {
         "data": {
             "metrics": [
@@ -187,6 +294,253 @@ def test_health_auto_export_json(tmp: Path) -> None:
     assert sleep["series"][0] == 7.5
 
 
+def test_reimport_adds_new_records_without_duplicating(tmp: Path) -> None:
+    env = isolate(tmp)
+    enter_person(env)
+    first = tmp / "first.xml"
+    first.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" startDate="2026-09-24 08:00:00 -0500" endDate="2026-09-24 09:00:00 -0500" value="1000"/>
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" startDate="2026-09-24 10:00:00 -0500" endDate="2026-09-24 11:00:00 -0500" value="250"/>
+</HealthData>
+"""
+    )
+    assert run(env, "ohealth_sync.py", ["--export", str(first)]).returncode == 0
+    repeat = run(env, "ohealth_sync.py", ["--export", str(first)])
+    assert repeat.returncode == 0, repeat.stderr
+    index = load_index(env)
+    steps = next(item for item in index["ranges"]["7d"]["metrics"] if item["id"] == "steps")
+    assert steps["series"] == [1250]
+
+    second = tmp / "second.xml"
+    second.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" startDate="2026-09-24 08:00:00 -0500" endDate="2026-09-24 09:00:00 -0500" value="1000"/>
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" startDate="2026-09-25 08:00:00 -0500" endDate="2026-09-25 09:00:00 -0500" value="4000"/>
+  <Record type="HKQuantityTypeIdentifierHeartRate" unit="count/min" startDate="2026-09-24 08:00:00 -0500" endDate="2026-09-24 08:00:00 -0500" value="60"/>
+</HealthData>
+"""
+    )
+    merged = run(env, "ohealth_sync.py", ["--export", str(second)])
+    assert merged.returncode == 0, merged.stderr
+    index = load_index(env)
+    window = index["ranges"]["7d"]
+    assert window["days"] == ["2026-09-24", "2026-09-25"]
+    steps = next(item for item in window["metrics"] if item["id"] == "steps")
+    assert steps["series"] == [1250, 4000]
+    heart = next(item for item in window["metrics"] if item["id"] == "heartRate")
+    assert heart["series"][0] == 60
+    plain = run(env, "ohealth_sync.py", [])
+    assert plain.returncode == 0, plain.stderr
+    index = load_index(env)
+    steps = next(item for item in index["ranges"]["7d"]["metrics"] if item["id"] == "steps")
+    assert steps["series"] == [1250, 4000]
+
+
+def test_database_selection_is_stored(tmp: Path) -> None:
+    env = isolate(tmp)
+    enter_person(env)
+    first = tmp / "first.xml"
+    first.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" startDate="2026-09-24 08:00:00 -0500" endDate="2026-09-24 09:00:00 -0500" value="11"/>
+</HealthData>
+"""
+    )
+    assert run(env, "ohealth_sync.py", ["--export", str(first)]).returncode == 0
+    catalog = Path(env["XDG_CONFIG_HOME"]) / "ohealth" / "ohealth.sqlite"
+    import sqlite3
+    saved = sqlite3.connect(catalog).execute("SELECT value FROM meta WHERE key = 'database'").fetchone()[0]
+    assert Path(saved) == catalog
+
+    other = tmp / "other.sqlite"
+    second = tmp / "second.xml"
+    second.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" startDate="2026-09-24 08:00:00 -0500" endDate="2026-09-24 09:00:00 -0500" value="88"/>
+</HealthData>
+"""
+    )
+    added = run(env, "ohealth_sync.py", ["--database", str(other), "--add-user", "Alex"])
+    assert added.returncode == 0, added.stderr
+    other_people = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "users.json").read_text())
+    other_id = next(item["id"] for item in other_people["users"] if item["name"] == "Alex")
+    switched = run(env, "ohealth_sync.py", ["--user", other_id, "--export", str(second)])
+    assert switched.returncode == 0, switched.stderr
+    saved = sqlite3.connect(catalog).execute("SELECT value FROM meta WHERE key = 'database'").fetchone()[0]
+    assert Path(saved) == other.resolve()
+    index = load_index(env)
+    steps = next(item for item in index["ranges"]["7d"]["metrics"] if item["id"] == "steps")
+    assert steps["series"] == [88]
+    status = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "status.json").read_text())
+    assert status["database"] == str(other.resolve())
+
+    back = run(env, "ohealth_sync.py", ["--database", str(catalog)])
+    assert back.returncode == 0, back.stderr
+    index = load_index(env)
+    steps = next(item for item in index["ranges"]["7d"]["metrics"] if item["id"] == "steps")
+    assert steps["series"] == [11]
+    saved = sqlite3.connect(catalog).execute("SELECT value FROM meta WHERE key = 'database'").fetchone()[0]
+    assert Path(saved) == catalog.resolve()
+
+
+def test_xrays_and_labs_are_in_the_database_for_the_agent(tmp: Path) -> None:
+    env = isolate(tmp)
+    enter_person(env, "Alex")
+    image = tmp / "chest.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nnot-really")
+    blood = tmp / "cbc.pdf"
+    blood.write_text("hemoglobin 14")
+    urine = tmp / "ua.pdf"
+    urine.write_text("negative")
+    assert run(env, "ohealth_sync.py", ["--xray", "--file", str(image)]).returncode == 0
+    assert run(env, "ohealth_sync.py", ["--blood", "--file", str(blood)]).returncode == 0
+    assert run(env, "ohealth_sync.py", ["--urine", "--file", str(urine)]).returncode == 0
+
+    import sqlite3
+    config = Path(env["XDG_CONFIG_HOME"]) / "ohealth"
+    database = config / "ohealth.sqlite"
+    rows = sqlite3.connect(database).execute("SELECT kind, name, path FROM files ORDER BY kind").fetchall()
+    assert {row[0] for row in rows} == {"blood", "urine", "xray"}
+    originals = {"chest.png": image, "cbc.pdf": blood, "ua.pdf": urine}
+    for _kind, name, stored in rows:
+        path = Path(stored)
+        assert path.is_file()
+        assert config in path.parents
+        assert path.read_bytes() == originals[name].read_bytes()
+    listed = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "files.json").read_text())
+    assert listed["xrays"][0]["name"] == "chest.png"
+    assert listed["blood"][0]["name"] == "cbc.pdf"
+    assert listed["urine"][0]["name"] == "ua.pdf"
+
+    chosen = run(env, "ohealth_agent.py", ["set", "grok"])
+    assert chosen.returncode == 0, chosen.stderr
+    asked = run(
+        env,
+        "ohealth_agent.py",
+        ["chat", "--dry-run"],
+        stdin=json.dumps({
+            "message": "Review the selected chest X-ray and compare it with my steps.",
+            "scope": "selected",
+            "focusId": listed["xrays"][0]["id"],
+            "metric": "Steps",
+            "range": "7 days",
+            "day": "2026-09-24",
+            "dayValue": "1000",
+        }),
+    )
+    assert asked.returncode == 0, asked.stderr
+    assert "grok" == json.loads(asked.stdout)["argv"][0]
+    assert "--prompt-file" in json.loads(asked.stdout)["argv"]
+    assert "--output-format" in json.loads(asked.stdout)["argv"]
+    prompt = json.loads(asked.stdout)["prompt"]
+    assert str(database) in prompt
+    assert "Read that database" in prompt
+    assert "Alex" in prompt
+    assert "user_id" in prompt
+    assert "chest.png" in prompt
+    assert "Review the selected chest X-ray" in prompt
+    assert "selected " in prompt
+    whole = run(
+        env,
+        "ohealth_agent.py",
+        ["chat", "--dry-run"],
+        stdin=json.dumps({"message": "Summarize every stored day.", "scope": "all"}),
+    )
+    assert whole.returncode == 0, whole.stderr
+    assert "whole database" in json.loads(whole.stdout)["prompt"]
+
+
+def test_people_keep_separate_records(tmp: Path) -> None:
+    env = isolate(tmp)
+    alex = enter_person(env, "Alex")
+    image = tmp / "chest.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nnot-really")
+    alex_xml = tmp / "alex.xml"
+    alex_xml.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" startDate="2026-09-24 08:00:00 -0500" endDate="2026-09-24 09:00:00 -0500" value="11"/>
+</HealthData>
+"""
+    )
+    assert run(env, "ohealth_sync.py", ["--export", str(alex_xml)]).returncode == 0
+    assert run(env, "ohealth_sync.py", ["--xray", "--file", str(image)]).returncode == 0
+    blake_added = run(env, "ohealth_sync.py", ["--add-user", "Blake"])
+    assert blake_added.returncode == 0, blake_added.stderr
+    people = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "users.json").read_text())
+    blake = next(item["id"] for item in people["users"] if item["name"] == "Blake")
+    blake_xml = tmp / "blake.xml"
+    blake_xml.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" startDate="2026-09-24 08:00:00 -0500" endDate="2026-09-24 09:00:00 -0500" value="88"/>
+</HealthData>
+"""
+    )
+    opened = run(env, "ohealth_sync.py", ["--user", blake, "--export", str(blake_xml)])
+    assert opened.returncode == 0, opened.stderr
+    index = load_index(env)
+    steps = next(item for item in index["ranges"]["7d"]["metrics"] if item["id"] == "steps")
+    assert steps["series"] == [88]
+    files = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "files.json").read_text())
+    assert files["xrays"] == []
+    back = run(env, "ohealth_sync.py", ["--user", alex])
+    assert back.returncode == 0, back.stderr
+    index = load_index(env)
+    steps = next(item for item in index["ranges"]["7d"]["metrics"] if item["id"] == "steps")
+    assert steps["series"] == [11]
+    files = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "files.json").read_text())
+    assert files["xrays"][0]["name"] == "chest.png"
+
+
+def test_existing_rows_become_a_person(tmp: Path) -> None:
+    env = isolate(tmp)
+    sys.path.insert(0, str(BIN))
+    from ohealth_sync import DAY_FIELDS
+
+    database = Path(env["XDG_CONFIG_HOME"]) / "ohealth" / "ohealth.sqlite"
+    database.parent.mkdir(parents=True)
+    import sqlite3
+    conn = sqlite3.connect(database)
+    columns = ", ".join(f"{name} REAL" for name in DAY_FIELDS)
+    conn.execute(f"CREATE TABLE days (date TEXT PRIMARY KEY, {columns})")
+    conn.execute("INSERT INTO days (date, steps) VALUES ('2026-09-24', 17)")
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute("INSERT INTO meta (key, value) VALUES ('stored', '1')")
+    conn.commit()
+    conn.close()
+    listed = run(env, "ohealth_sync.py", ["--users"])
+    assert listed.returncode == 0, listed.stderr
+    people = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "users.json").read_text())
+    assert people["current"] == ""
+    assert people["users"][0]["name"] == "Existing"
+    opened = run(env, "ohealth_sync.py", ["--user", people["users"][0]["id"]])
+    assert opened.returncode == 0, opened.stderr
+    index = load_index(env)
+    steps = next(item for item in index["ranges"]["7d"]["metrics"] if item["id"] == "steps")
+    assert steps["series"] == [17]
+
+
+def test_import_requires_a_person(tmp: Path) -> None:
+    env = isolate(tmp)
+    xml = tmp / "export.xml"
+    xml.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" startDate="2026-09-24 08:00:00 -0500" endDate="2026-09-24 09:00:00 -0500" value="1"/>
+</HealthData>
+"""
+    )
+    result = run(env, "ohealth_sync.py", ["--export", str(xml)])
+    assert result.returncode == 1
+    assert "person" in result.stderr.lower()
+
+
 def test_missing_export_is_an_error(tmp: Path) -> None:
     env = isolate(tmp)
     result = run(env, "ohealth_sync.py", ["--export", str(tmp / "nope.zip")])
@@ -194,105 +548,6 @@ def test_missing_export_is_an_error(tmp: Path) -> None:
     status = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "status.json").read_text())
     assert status["state"] == "error"
     assert "does not exist" in status["message"]
-
-
-def test_helper_status_logout_and_missing_pyicloud(tmp: Path) -> None:
-    env = isolate(tmp)
-    status = run(env, "ohealth_helper.py", ["status"])
-    assert status.returncode == 0, status.stderr
-    body = json.loads(status.stdout)
-    assert body["signedIn"] is False
-    assert body["backend"] in {"missing", "pyicloud", "pyicloud_ipd"}
-    login = run(env, "ohealth_helper.py", ["login", "--username", "person@icloud.com", "--save-config"], stdin="secret\n")
-    # Without pyicloud this is a clean error and the password is not in the config.
-    if body["backend"] == "missing":
-        assert login.returncode != 0
-        message = json.loads(login.stdout)
-        assert message["ok"] is False
-        assert "pyicloud" in message["error"]
-        config = (Path(env["XDG_CONFIG_HOME"]) / "ohealth" / "config").read_text()
-        assert "secret" not in config
-        assert not any(line.strip().startswith("APPLE_ID=") for line in config.splitlines())
-    else:
-        # A live sign-in is not attempted here beyond what the library does with a fake password.
-        # Either Apple rejects it or the library errors. The password must not land in config
-        # unless ok is true, which a fake password must not achieve.
-        config = (Path(env["XDG_CONFIG_HOME"]) / "ohealth" / "config").read_text()
-        assert "secret" not in config
-
-    # Writing an id and logging out removes only that line.
-    sys.path.insert(0, str(BIN))
-    for key, value in env.items():
-        if key.startswith(("OHEALTH", "XDG", "HOME")):
-            os.environ[key] = value
-    import importlib
-    import ohealth_paths
-    importlib.reload(ohealth_paths)
-    ohealth_paths.write_apple_id("person@icloud.com")
-    assert ohealth_paths.read_config()["APPLE_ID"] == "person@icloud.com"
-    logged_out = run(env, "ohealth_helper.py", ["logout"])
-    assert logged_out.returncode == 0, logged_out.stderr
-    importlib.reload(ohealth_paths)
-    assert "APPLE_ID" not in ohealth_paths.read_config()
-    note = json.loads(logged_out.stdout)
-    assert note["cookiesKept"] is True
-
-
-def test_connect_passes_accept_terms_when_supported(tmp: Path) -> None:
-    env = isolate(tmp)
-    for key, value in env.items():
-        if key.startswith(("OHEALTH", "XDG", "HOME")):
-            os.environ[key] = value
-    sys.path.insert(0, str(BIN))
-    import importlib
-    import ohealth_helper
-    importlib.reload(ohealth_helper)
-
-    seen: dict = {}
-
-    class Current:
-        def __init__(self, username, password=None, cookie_directory=None, accept_terms=False):
-            seen["current"] = {
-                "username": username,
-                "password": password,
-                "cookie_directory": cookie_directory,
-                "accept_terms": accept_terms,
-            }
-
-    class Vendored:
-        def __init__(self, domain, username, password_fn, cookie_directory=None):
-            seen["vendored"] = {
-                "domain": domain,
-                "username": username,
-                "password": password_fn(),
-                "cookie_directory": cookie_directory,
-            }
-
-    class Ancient:
-        def __init__(self, username, password=None):
-            seen["ancient"] = {"username": username, "password": password}
-
-    cookies = tmp / "cookies"
-    ohealth_helper.connect("pyicloud", Current, "person@icloud.com", lambda: "secret", str(cookies))
-    assert seen["current"]["accept_terms"] is True
-    assert seen["current"]["cookie_directory"] == str(cookies)
-    assert seen["current"]["password"] == "secret"
-    assert cookies.is_dir()
-
-    ohealth_helper.connect("pyicloud_ipd", Vendored, "person@icloud.com", lambda: "secret", str(cookies))
-    assert seen["vendored"]["domain"] == "com"
-    assert seen["vendored"]["cookie_directory"] == str(cookies)
-    assert "accept_terms" not in seen["vendored"]
-
-    ohealth_helper.connect("pyicloud", Ancient, "person@icloud.com", lambda: "secret", str(cookies))
-    assert seen["ancient"]["password"] == "secret"
-
-    terms = type("PyiCloudAcceptTermsException", (Exception,), {})
-    assert ohealth_helper.needs_terms(terms("Could not get terms version"))
-    assert ohealth_helper.needs_terms(
-        Exception("You must accept the updated terms of service to continue.")
-    )
-    assert not ohealth_helper.needs_terms(Exception("wrong code"))
 
 
 def test_agent_picker_writes_omarchy_file(tmp: Path) -> None:
@@ -356,10 +611,16 @@ def main() -> None:
         test_sample_is_labeled_and_ranged,
         test_apple_export_xml_and_units,
         test_export_zip_and_empty_inbox,
+        test_pick_uses_the_file_the_chooser_prints,
+        test_chooser_window_is_the_new_file_dialog,
         test_health_auto_export_json,
+        test_reimport_adds_new_records_without_duplicating,
+        test_database_selection_is_stored,
+        test_xrays_and_labs_are_in_the_database_for_the_agent,
+        test_people_keep_separate_records,
+        test_existing_rows_become_a_person,
+        test_import_requires_a_person,
         test_missing_export_is_an_error,
-        test_helper_status_logout_and_missing_pyicloud,
-        test_connect_passes_accept_terms_when_supported,
         test_agent_picker_writes_omarchy_file,
     ]
     failed = 0

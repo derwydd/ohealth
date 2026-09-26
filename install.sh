@@ -11,7 +11,7 @@ if ! command -v quickshell >/dev/null 2>&1; then
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required for sign-in, sync, and the agent picker" >&2
+  echo "python3 is required for sync and the agent picker" >&2
   exit 1
 fi
 
@@ -20,8 +20,8 @@ mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications" "$config/ohealth" 
 
 ln -sfn "$here/bin/ohealth" "$HOME/.local/bin/ohealth"
 ln -sfn "$here/bin/ohealth-sync" "$HOME/.local/bin/ohealth-sync"
-ln -sfn "$here/bin/ohealth-helper" "$HOME/.local/bin/ohealth-helper"
 ln -sfn "$here/bin/ohealth-agent" "$HOME/.local/bin/ohealth-agent"
+rm -f "$HOME/.local/bin/ohealth-helper"
 
 if [[ ! -f "$config/ohealth/config" ]]; then
   python3 - <<PY
@@ -31,23 +31,7 @@ os.environ.setdefault("XDG_CONFIG_HOME", "$config")
 from ohealth_paths import ensure_layout
 ensure_layout()
 PY
-  echo "Start ohealth and sign in with your Apple ID, or run ohealth --sample."
-fi
-
-# Apple sign-in uses pyicloud. The window still opens without it; sign-in
-# reports that the package is missing until this venv exists.
-if [[ ! -x "$here/.venv/bin/python" ]]; then
-  python3 -m venv "$here/.venv" || true
-fi
-if [[ -x "$here/.venv/bin/python" ]]; then
-  if ! "$here/.venv/bin/python" -c 'import pyicloud' 2>/dev/null \
-     && ! "$here/.venv/bin/python" -c 'import pyicloud_ipd' 2>/dev/null; then
-    echo "installing pyicloud into $here/.venv …"
-    # rich is imported by current pyicloud even when the wheel does not pull it in.
-    if ! "$here/.venv/bin/pip" install -q pyicloud rich; then
-      echo "pyicloud did not install. Apple sign-in will say so until it does. Sample data and a local Health export still work." >&2
-    fi
-  fi
+  echo "Start ohealth, or run ohealth --sample for invented numbers."
 fi
 
 cp "$here/ohealth.desktop" "$HOME/.local/share/applications/ohealth.desktop"

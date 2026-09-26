@@ -1,9 +1,7 @@
 """Paths and config shared by the OHealth data layer.
 
-Layout matches Omarchy iCloud Photos: a sourced config under
-~/.config/ohealth, a cache of JSON the window watches, and an inbox for
-files the sync reads. The Apple session directory defaults to
-~/.config/icloudpd, the same cookie jar that app uses.
+A sourced config under ~/.config/ohealth, a cache of JSON the window
+watches, and an inbox for files the sync reads.
 """
 
 from __future__ import annotations
@@ -39,6 +37,30 @@ def config_path() -> Path:
     return config_dir() / "config"
 
 
+def db_path() -> Path:
+    return config_dir() / "ohealth.sqlite"
+
+
+def xray_dir() -> Path:
+    return config_dir() / "xrays"
+
+
+def document_dir() -> Path:
+    return config_dir() / "documents"
+
+
+def files_path() -> Path:
+    return cache_dir() / "files.json"
+
+
+def chat_path() -> Path:
+    return cache_dir() / "chat.json"
+
+
+def users_path() -> Path:
+    return cache_dir() / "users.json"
+
+
 def index_path() -> Path:
     return cache_dir() / "index.json"
 
@@ -60,11 +82,6 @@ def theme_state_dir() -> Path:
 
 
 DEFAULT_CONFIG = """# OHealth configuration. Sourced conceptually as KEY=VALUE lines.
-# APPLE_ID is written by the sign-in card. The password is never stored.
-# COOKIES is the iCloud session jar. It defaults to the same directory
-# Omarchy iCloud Photos uses (~/.config/icloudpd) so one Apple sign-in
-# can be shared. Health records do not come from this session.
-COOKIES=$HOME/.config/icloudpd
 # EXPORT=
 # Optional file or directory: Apple Health export.zip / export.xml, or
 # Health Auto Export JSON. When unset, sync reads the inbox:
@@ -73,7 +90,7 @@ COOKIES=$HOME/.config/icloudpd
 
 
 def ensure_layout() -> None:
-    for path in (config_dir(), cache_dir(), inbox_dir()):
+    for path in (config_dir(), cache_dir(), inbox_dir(), xray_dir(), document_dir()):
         path.mkdir(parents=True, exist_ok=True)
         os.chmod(path, 0o700)
     if not config_path().exists():
@@ -82,9 +99,7 @@ def ensure_layout() -> None:
 
 
 def read_config() -> dict[str, str]:
-    cfg: dict[str, str] = {
-        "COOKIES": str(home() / ".config" / "icloudpd"),
-    }
+    cfg: dict[str, str] = {}
     path = config_path()
     if not path.exists():
         return cfg
@@ -97,29 +112,22 @@ def read_config() -> dict[str, str]:
     return cfg
 
 
-def write_apple_id(apple_id: str) -> None:
-    """Set APPLE_ID, keeping every other line."""
+def write_export(path: str) -> None:
+    """Remember the Health export the window opened, keeping every other line."""
     ensure_layout()
-    path = config_path()
-    lines = path.read_text().splitlines() if path.exists() else DEFAULT_CONFIG.splitlines()
+    config = config_path()
+    lines = config.read_text().splitlines() if config.exists() else DEFAULT_CONFIG.splitlines()
     out: list[str] = []
     done = False
     for line in lines:
-        if line.strip().startswith("APPLE_ID="):
-            out.append(f"APPLE_ID={apple_id}")
+        if line.strip().startswith("EXPORT="):
+            out.append(f"EXPORT={path}")
             done = True
         else:
             out.append(line)
     if not done:
-        out.append(f"APPLE_ID={apple_id}")
-    path.write_text("\n".join(out) + "\n")
-    os.chmod(path, 0o600)
+        out.append(f"EXPORT={path}")
+    config.write_text("\n".join(out) + "\n")
+    os.chmod(config, 0o600)
 
 
-def clear_apple_id() -> None:
-    path = config_path()
-    if not path.exists():
-        return
-    kept = [line for line in path.read_text().splitlines() if not line.strip().startswith("APPLE_ID=")]
-    path.write_text("\n".join(kept) + "\n")
-    os.chmod(path, 0o600)

@@ -1,25 +1,25 @@
 import QtQuick
-import QtQuick.Controls.Basic
 import Quickshell
 import Quickshell.Io
 
 // OHealth: activity, vitals, and trends in one keyboard-driven window.
 //
-// Data comes from bin/ohealth-sync, which writes index.json and status.json
-// under ~/.cache/ohealth. Sign-in is bin/ohealth-helper (pyicloud, same cookie
-// jar as Omarchy iCloud Photos). The agent row reads and writes
-// ~/.config/omarchy/defaults/agent.
+// Data comes from ~/.config/ohealth/ohealth.sqlite, one person at a time.
+// Opening the window asks who this session is for, then bin/ohealth-sync
+// publishes that person's rows as index.json and status.json under
+// ~/.cache/ohealth. Import is the path that reads an Apple Health export.
 //
 // Keys: tab moves regions, 1-4 pick a range, hjkl or arrows move inside the
-// region, enter asks the Omarchy agent, a opens the agent list, r syncs,
-// shift+r checks the Apple session, ? lists every key.
+// region, enter asks the Omarchy agent, a opens the agent list, r reloads
+// the saved database, ? lists every key.
 ShellRoot {
   id: root
 
   Component.onCompleted: {
     Quickshell.inhibitReloadPopup()
     refreshAgents()
-    if (sampleRequested) useSample()
+    if (sampleRequested) root.sampleOnNextEnter = true
+    refreshPeople()
   }
 
   readonly property bool sampleRequested: Quickshell.env("OHEALTH_SAMPLE") === "1"
@@ -29,19 +29,18 @@ ShellRoot {
   readonly property string cacheDir: (Quickshell.env("XDG_CACHE_HOME") || (homeDir + "/.cache")) + "/ohealth"
   readonly property string binDir: Quickshell.shellDir + "/../bin"
   readonly property string syncScript: binDir + "/ohealth-sync"
-  readonly property string helperScript: binDir + "/ohealth-helper"
   readonly property string agentScript: binDir + "/ohealth-agent"
-  readonly property string configPath: configHome + "/ohealth/config"
+  readonly property string defaultDatabase: configHome + "/ohealth/ohealth.sqlite"
+  readonly property string databasePath: (status && status.database) ? status.database : defaultDatabase
   readonly property var rangeIds: ["7d", "30d", "90d", "365d"]
   readonly property var zones: ["ranges", "metrics", "days", "agent"]
 
   property bool sampleMode: false
-  property bool configLoaded: false
-  property bool booted: false
-  property string appleId: ""
-  property string session: ""
-  property string sessionNote: ""
-  property string themeName: ""
+  property bool exportBusy: false
+  property string importDots: "."
+  property bool fileMenuOpen: false
+  property bool settingsOpen: false
+  property bool keysOpen: false
   property var index: null
   property var status: ({ state: "loading", message: "Reading health data…" })
   property var view: ({})
@@ -53,20 +52,27 @@ ShellRoot {
   property int agentCursor: 0
   property string pendingAgentId: ""
   property bool placedDay: false
-  property bool helpOpen: false
   property bool agentOpen: false
+  property string chatScope: "selected"
+  property string chatFocusId: ""
+  property string gallery: ""
+  property bool chatBusy: false
+  property var library: ({ xrays: [], blood: [], urine: [] })
+  property var chatMessages: []
+  property var people: ({ users: [], current: "", currentName: "" })
+  property bool sessionEntered: false
+  property bool sampleOnNextEnter: false
+  property string pendingImport: ""
   property string colorRaw: ""
   property string themeShellRaw: ""
   property string machineShellRaw: ""
 
-  readonly property bool needLogin: !sampleMode && configLoaded && (appleId === "" || session === "auth-required")
   readonly property string zone: zones[zoneIndex]
   readonly property string screen: {
     var days = (view && view.dayCount) ? view.dayCount : 0
     if (days > 0) return "ready"
     if (status && status.state === "error") return "error"
-    if (status && status.state === "syncing") return "loading"
-    if (configLoaded && !needLogin) return "empty"
+    if (status && status.state === "empty") return "empty"
     return "loading"
   }
   readonly property string errorMessage: (status && status.state === "error") ? (status.message || "") : ""
@@ -80,9 +86,40 @@ ShellRoot {
     appTheme.applyShell(machineShellRaw)
   }
 
-  function parseAppleId(raw) {
-    var m = String(raw || "").match(/^\s*APPLE_ID=["']?([^"'\n]+)/m)
-    return m ? m[1].trim() : ""
+  function openSettings() {
+    fileMenuOpen = false
+    if (keysOpen) closeKeys()
+    settingsOpen = true
+    settingsRaise.ticks = 0
+    settingsRaise.start()
+  }
+
+  function closeSettings() {
+    settingsOpen = false
+    settingsRaise.stop()
+    placeWindow("OHealth Settings", false)
+    keys.forceActiveFocus()
+  }
+
+  function openKeys() {
+    fileMenuOpen = false
+    if (settingsOpen) closeSettings()
+    keysOpen = true
+    keysRaise.ticks = 0
+    keysRaise.start()
+  }
+
+  function closeKeys() {
+    keysOpen = false
+    keysRaise.stop()
+    placeWindow("OHealth Keyboard", false)
+    keys.forceActiveFocus()
+  }
+
+  function chooseDatabase() {
+    if (pickDatabase.running || exportBusy) return
+    pickDatabase.command = [syncScript, "--select-database"]
+    pickDatabase.running = true
   }
 
   function rebuild() {
@@ -206,26 +243,96 @@ ShellRoot {
 
   function useSample() {
     sampleMode = true
-    session = ""
-    booted = true
     startSync()
     keys.forceActiveFocus()
   }
 
+  function activePersonName() {
+    if (people && people.currentName) return people.currentName
+    if (status && status.userName) return status.userName
+    return ""
+  }
+
+  function refreshPeople() {
+    if (usersProc.running) return
+    usersProc.command = [syncScript, "--users"]
+    usersProc.running = true
+  }
+
+  function addPerson(name) {
+    var trimmed = String(name || "").trim()
+    if (!trimmed || usersProc.running) return
+    usersProc.command = [syncScript, "--add-user", trimmed]
+    usersProc.running = true
+  }
+
+  function enterPerson(id) {
+    if (!id || personProc.running) return
+    var args = [syncScript, "--user", id]
+    if (sampleOnNextEnter) {
+      sampleMode = true
+      sampleOnNextEnter = false
+      args.push("--sample")
+    }
+    personProc.command = args
+    personProc.running = true
+  }
+
+  function askImport(kind) {
+    fileMenuOpen = false
+    if (!sessionEntered || !activePersonName()) {
+      toast.show("Choose a person first")
+      return
+    }
+    pendingImport = kind
+  }
+
+  function confirmImport() {
+    var kind = pendingImport
+    pendingImport = ""
+    if (kind === "export") openExportFile()
+    else if (kind === "xray") importRecord("--xray")
+    else if (kind === "blood") importRecord("--blood")
+    else if (kind === "urine") importRecord("--urine")
+  }
+
+  function importPrompt() {
+    var name = activePersonName()
+    if (pendingImport === "export") return "Save this Apple Health export for " + name + "?"
+    if (pendingImport === "xray") return "Save this X-ray for " + name + "?"
+    if (pendingImport === "blood") return "Save this blood test for " + name + "?"
+    if (pendingImport === "urine") return "Save this urine test for " + name + "?"
+    return "Save this file for " + name + "?"
+  }
+
   function startSync() {
-    if (sync.running) return
+    if (sync.running) return false
     sync.command = sampleMode ? [syncScript, "--sample"] : [syncScript]
     status = {
       state: "syncing",
-      message: sampleMode ? "Building sample data…" : "Reading health data…"
+      message: sampleMode ? "Building sample data…" : "Opening saved health data…"
     }
     sync.running = true
+    return true
   }
 
-  function startProbe() {
-    if (probe.running || appleId === "") return
-    probe.command = [helperScript, "probe"]
-    probe.running = true
+  function finishImport() {
+    exportBusy = false
+    importDotsTimer.stop()
+  }
+
+  function openExportFile() {
+    if (pickExport.running || exportBusy) return
+    if (sync.running) {
+      toast.show("Still opening saved health data")
+      return
+    }
+    exportBusy = true
+    importDots = "."
+    importDotsTimer.step = 0
+    importDotsTimer.start()
+    pickExport.command = [syncScript, "--pick"]
+    pickExport.running = true
   }
 
   function refreshAgents() {
@@ -234,47 +341,46 @@ ShellRoot {
     agentsProc.running = true
   }
 
-  function startLogin(username, password) {
-    login.password = password
-    login.command = [helperScript, "login", "--username", username, "--save-config"]
-    login.running = true
+  function sendChat(text) {
+    if (!agents || !agents.selected) {
+      openAgents()
+      toast.show("Choose an Omarchy agent first")
+      return
+    }
+    if (chatProc.running) return
+    var metrics = (view && view.metrics) ? view.metrics : []
+    var metric = (metricIndex >= 0 && metricIndex < metrics.length) ? metrics[metricIndex] : null
+    var days = (view && view.days) ? view.days : []
+    var payload = {
+      message: text,
+      scope: chatScope,
+      focusId: chatFocusId,
+      sample: !!(index && index.labeledSample) || sampleMode,
+      range: view.label || "",
+      metric: metric ? metric.name : "",
+      day: dayIndex < days.length ? days[dayIndex] : "",
+      dayValue: (metric && metric.seriesText && dayIndex < metric.seriesText.length) ? metric.seriesText[dayIndex] : "",
+      trend: metric ? metric.trend : ""
+    }
+    chatBusy = true
+    chatProc.payload = JSON.stringify(payload)
+    chatProc.command = [agentScript, "chat"]
+    chatProc.running = true
   }
 
-  function loginLine(line) {
-    var msg = null
-    try { msg = JSON.parse(String(line).trim()) } catch (e) { return }
-    if (msg.step === "2fa") {
-      loginCard.busy = false
-      loginCard.step = "code"
-    } else if (msg.ok) {
-      loginCard.busy = false
-      loginCard.reset()
-      appleId = msg.username
-      session = "ok"
-      sessionNote = "Signed in"
-      sampleMode = false
-      toast.show("Signed in as " + msg.username)
-      keys.forceActiveFocus()
-      startSync()
-    } else if (msg.error) {
-      loginCard.busy = false
-      loginCard.error = msg.error
-      if (loginCard.step === "code") loginCard.step = "credentials"
+  function importRecord(flag) {
+    if (pickRecord.running || exportBusy) return
+    if (sync.running) {
+      toast.show("Still opening saved health data")
+      return
     }
-  }
-
-  function probeLine(line) {
-    var msg = null
-    try { msg = JSON.parse(String(line).trim()) } catch (e) { return }
-    if (msg.ok) {
-      session = "ok"
-      sessionNote = "Apple session ok"
-    } else {
-      sessionNote = msg.error || "Apple session check failed"
-      if (sessionNote.indexOf("expired") >= 0) session = "auth-required"
-      else session = "error"
-      if (session === "auth-required") toast.show(sessionNote)
-    }
+    fileMenuOpen = false
+    exportBusy = true
+    importDots = "."
+    importDotsTimer.step = 0
+    importDotsTimer.start()
+    pickRecord.command = [syncScript, flag]
+    pickRecord.running = true
   }
 
   function ask() {
@@ -344,13 +450,6 @@ ShellRoot {
     onFileChanged: reload()
   }
   FileView {
-    path: root.stateHome + "/omarchy/current/theme.name"
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.themeName = String(text() || "").trim().replace(/-/g, " ")
-    onFileChanged: reload()
-  }
-  FileView {
     id: indexFile
     path: root.cacheDir + "/index.json"
     watchChanges: true
@@ -367,47 +466,142 @@ ShellRoot {
     onFileChanged: reload()
   }
   FileView {
-    id: configFile
-    path: root.configPath
+    id: filesView
+    path: root.cacheDir + "/files.json"
     watchChanges: true
     printErrors: false
     onLoaded: {
-      root.appleId = root.parseAppleId(text())
-      root.configLoaded = true
-      if (root.sampleRequested || root.sampleMode) return
-      if (root.appleId !== "" && !root.booted) {
-        root.booted = true
-        root.startSync()
-        root.startProbe()
-      }
+      try { root.library = JSON.parse(text()) } catch (e) { return }
     }
-    onLoadFailed: root.configLoaded = true
+    onFileChanged: reload()
+  }
+  FileView {
+    id: chatView
+    path: root.cacheDir + "/chat.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      try {
+        var parsed = JSON.parse(text())
+        root.chatMessages = parsed.messages || []
+      } catch (e) { return }
+    }
+    onFileChanged: reload()
+  }
+  FileView {
+    id: usersFile
+    path: root.cacheDir + "/users.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      try { root.people = JSON.parse(text()) } catch (e) { return }
+    }
     onFileChanged: reload()
   }
 
   Process {
-    id: login
+    id: sync
+    running: false
+    onExited: {
+      indexFile.reload()
+      statusFile.reload()
+      filesView.reload()
+      chatView.reload()
+      if (root.exportBusy) root.finishImport()
+    }
+  }
+  Process {
+    id: chatProc
     running: false
     stdinEnabled: true
-    property string password: ""
-    onStarted: { write(password + "\n"); password = "" }
-    stdout: SplitParser { onRead: data => root.loginLine(data) }
+    property string payload: ""
+    onStarted: write(payload + "\n")
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var msg = {}
+        try { msg = JSON.parse(text) } catch (e) {
+          toast.show("The agent returned nothing")
+          return
+        }
+        if (!msg.ok) toast.show(msg.error || "The agent did not answer")
+        chatView.reload()
+      }
+    }
     onExited: {
-      if (loginCard.busy) {
-        loginCard.busy = false
-        if (loginCard.error === "") loginCard.error = "The sign-in helper stopped without an answer"
+      root.chatBusy = false
+      chatView.reload()
+    }
+  }
+  Process {
+    id: usersProc
+    running: false
+    stderr: StdioCollector { id: usersErr }
+    onExited: (exitCode) => {
+      usersFile.reload()
+      if (exitCode !== 0) toast.show(String(usersErr.text || "").trim() || "Could not update people")
+      else if (usersProc.command.length > 1 && usersProc.command[1] === "--add-user") personField.text = ""
+    }
+  }
+  Process {
+    id: personProc
+    running: false
+    stderr: StdioCollector { id: personErr }
+    onExited: (exitCode) => {
+      if (exitCode !== 0) {
+        toast.show(String(personErr.text || "").trim() || "Could not open that person")
+        return
+      }
+      root.sessionEntered = true
+      indexFile.reload()
+      statusFile.reload()
+      filesView.reload()
+      chatView.reload()
+      usersFile.reload()
+      keys.forceActiveFocus()
+    }
+  }
+  Process {
+    id: pickRecord
+    running: false
+    stderr: StdioCollector { id: recordErr }
+    onExited: (exitCode) => {
+      root.finishImport()
+      if (exitCode === 0) filesView.reload()
+      else if (exitCode !== 3) toast.show(String(recordErr.text || "").trim() || "Could not import that file")
+    }
+  }
+  Process {
+    id: pickExport
+    running: false
+    stderr: StdioCollector { id: pickErr }
+    onExited: (exitCode) => {
+      if (exitCode === 0) {
+        root.sampleMode = false
+        root.placedDay = false
+        if (!root.startSync()) root.finishImport()
+      } else {
+        root.finishImport()
+        if (exitCode !== 3) {
+          toast.show(String(pickErr.text || "").trim() || "Could not open the file manager")
+          statusFile.reload()
+        }
       }
     }
   }
   Process {
-    id: sync
+    id: pickDatabase
     running: false
-    onExited: { indexFile.reload(); statusFile.reload() }
-  }
-  Process {
-    id: probe
-    running: false
-    stdout: SplitParser { onRead: data => root.probeLine(data) }
+    stderr: StdioCollector { id: databaseErr }
+    onExited: (exitCode) => {
+      if (exitCode === 0) {
+        root.placedDay = false
+        indexFile.reload()
+        statusFile.reload()
+      } else if (exitCode !== 3) {
+        toast.show(String(databaseErr.text || "").trim() || "Could not choose a database")
+        statusFile.reload()
+      }
+    }
   }
   Process {
     id: agentsProc
@@ -437,7 +631,7 @@ ShellRoot {
     running: false
     stdinEnabled: true
     property string payload: ""
-    onStarted: write(payload)
+    onStarted: write(payload + "\n")
     stdout: StdioCollector {
       onStreamFinished: {
         var msg = {}
@@ -451,6 +645,54 @@ ShellRoot {
     }
   }
   Process { id: omarchyPick }
+  Process {
+    id: settingsPlace
+    running: false
+  }
+  Timer {
+    id: settingsRaise
+    interval: 90
+    repeat: true
+    property int ticks: 0
+    onTriggered: {
+      ticks++
+      if (ticks > 10 || !root.settingsOpen) {
+        stop()
+        return
+      }
+      root.placeWindow("OHealth Settings", true)
+    }
+  }
+
+  function placeWindow(title, pinOn) {
+    var action = pinOn ? "on" : "off"
+    var sel = "title:^(" + title + ")$"
+    var script = "hyprctl dispatch 'hl.dsp.window.pin({ action = \"" + action + "\", window = \"" + sel + "\" })'"
+    if (pinOn) {
+      script = "hyprctl dispatch 'hl.dsp.window.float({ action = \"set\", window = \"" + sel + "\" })'; " +
+               "hyprctl dispatch 'hl.dsp.window.alter_zorder({ mode = \"top\", window = \"" + sel + "\" })'; " +
+               script + "; " +
+               "hyprctl dispatch 'hl.dsp.focus({ window = \"" + sel + "\" })'"
+    }
+    settingsPlace.command = ["sh", "-c", script]
+    settingsPlace.running = false
+    settingsPlace.running = true
+  }
+
+  Timer {
+    id: keysRaise
+    interval: 90
+    repeat: true
+    property int ticks: 0
+    onTriggered: {
+      ticks++
+      if (ticks > 10 || !root.keysOpen) {
+        stop()
+        return
+      }
+      root.placeWindow("OHealth Keyboard", true)
+    }
+  }
 
   Timer {
     id: agentSave
@@ -462,7 +704,7 @@ ShellRoot {
     id: win
     visible: true
     title: "OHealth"
-    implicitWidth: 1180
+    implicitWidth: 1500
     implicitHeight: 800
     color: appTheme.background
 
@@ -473,15 +715,9 @@ ShellRoot {
       Component.onCompleted: forceActiveFocus()
 
       Shortcut {
-        sequence: "Esc"
-        context: Qt.WindowShortcut
-        enabled: root.needLogin && !root.helpOpen
-        onActivated: Qt.quit()
-      }
-      Shortcut {
         sequence: "Ctrl+P"
         context: Qt.WindowShortcut
-        enabled: root.needLogin || root.screen === "empty" || root.sampleMode
+        enabled: root.screen === "empty" || root.sampleMode
         onActivated: root.useSample()
       }
 
@@ -490,9 +726,34 @@ ShellRoot {
         var t = event.text
         var shift = (event.modifiers & Qt.ShiftModifier) !== 0
         var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
-        if (root.needLogin) return
-        if (root.helpOpen) {
-          if (t === "?" || k === Qt.Key_Escape || t === "q") root.helpOpen = false
+        if (root.exportBusy) {
+          event.accepted = true
+          return
+        }
+        if (root.pendingImport) {
+          if (k === Qt.Key_Escape) root.pendingImport = ""
+          else if (k === Qt.Key_Return || k === Qt.Key_Enter) root.confirmImport()
+          event.accepted = true
+          return
+        }
+        if (!root.sessionEntered) {
+          if (personField.activeFocus) return
+          if (t === "q") { Qt.quit(); return }
+          event.accepted = true
+          return
+        }
+        if (root.fileMenuOpen) {
+          if (k === Qt.Key_Escape) root.fileMenuOpen = false
+          event.accepted = true
+          return
+        }
+        if (root.settingsOpen) {
+          if (k === Qt.Key_Escape) root.closeSettings()
+          event.accepted = true
+          return
+        }
+        if (root.keysOpen) {
+          if (t === "?" || k === Qt.Key_Escape || t === "q") root.closeKeys()
           event.accepted = true
           return
         }
@@ -508,12 +769,12 @@ ShellRoot {
           else if (t === "o" && root.agents && root.agents.omarchyLauncher) {
             omarchyPick.command = ["omarchy-agent", "--pick"]
             omarchyPick.running = true
-          } else if (t === "?") root.helpOpen = true
+          } else if (t === "?") root.openKeys()
           else return
           event.accepted = true
           return
         }
-        if (t === "?") { root.helpOpen = true; event.accepted = true; return }
+        if (t === "?") { root.openKeys(); event.accepted = true; return }
         if (t === "a") { root.openAgents(); event.accepted = true; return }
         if (ctrl && (t === "p" || t === "P")) { root.useSample(); event.accepted = true; return }
         if (t === "q") { Qt.quit(); return }
@@ -527,7 +788,6 @@ ShellRoot {
         else if (t === "[") root.moveRange(-1)
         else if (t === "]") root.moveRange(1)
         else if (t === "r") { root.sampleMode = false; root.startSync() }
-        else if (t === "R") root.startProbe()
         else if (k === Qt.Key_Return || k === Qt.Key_Enter) root.ask()
         else if (t === "g" || k === Qt.Key_Home) root.jumpEnds(false)
         else if (t === "G" || k === Qt.Key_End) root.jumpEnds(true)
@@ -542,57 +802,100 @@ ShellRoot {
       }
 
       Rectangle {
-        id: header
+        id: menuBar
+        z: 20
         anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: 30
+        color: appTheme.darkerBackground
+
+        Rectangle {
+          anchors.bottom: parent.bottom
+          width: parent.width
+          height: 1
+          color: appTheme.lighterBackground
+        }
+
+        Rectangle {
+          id: fileMenuButton
+          x: 6
+          anchors.verticalCenter: parent.verticalCenter
+          width: fileMenuLabel.implicitWidth + 22
+          height: 22
+          radius: 4
+          color: root.fileMenuOpen || fileMenuArea.containsMouse ? appTheme.selection : "transparent"
+          Text {
+            id: fileMenuLabel
+            anchors.centerIn: parent
+            text: "File"
+            color: appTheme.brightForeground
+            font.family: appTheme.fontFamily
+            font.pixelSize: appTheme.fontSize
+          }
+          MouseArea {
+            id: fileMenuArea
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.fileMenuOpen = !root.fileMenuOpen
+          }
+        }
+      }
+
+      Rectangle {
+        id: header
+        anchors.top: menuBar.bottom
         anchors.left: parent.left
         anchors.right: parent.right
         height: 56
         color: appTheme.darkBackground
-        visible: !root.needLogin
 
-        Row {
+        Item {
           anchors.left: parent.left
           anchors.leftMargin: 20
           anchors.verticalCenter: parent.verticalCenter
-          spacing: 14
-          Text {
-            text: "OHealth"
-            color: appTheme.brightForeground
-            font.family: appTheme.fontFamily
-            font.pixelSize: 18
-            font.bold: true
-            anchors.verticalCenter: parent.verticalCenter
+          width: titleRow.implicitWidth
+          height: titleRow.implicitHeight
+          Row {
+            id: titleRow
+            spacing: 14
+            Text {
+              text: "OHealth"
+              color: appTheme.brightForeground
+              font.family: appTheme.fontFamily
+              font.pixelSize: 18
+              font.bold: true
+              anchors.verticalCenter: parent.verticalCenter
+            }
+            Text {
+              visible: root.sessionEntered && root.activePersonName().length > 0
+              text: root.activePersonName()
+              color: appTheme.accent
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize
+              font.bold: true
+              anchors.verticalCenter: parent.verticalCenter
+            }
           }
-          Text {
-            text: root.appleId !== "" ? root.appleId : (root.sampleMode ? "Not signed in" : "")
-            color: appTheme.darkForeground
-            font.family: appTheme.fontFamily
-            font.pixelSize: appTheme.fontSize
-            anchors.verticalCenter: parent.verticalCenter
+          MouseArea {
+            anchors.fill: parent
+            enabled: root.sessionEntered
+            cursorShape: root.sessionEntered ? Qt.PointingHandCursor : Qt.ArrowCursor
+            onClicked: root.sessionEntered = false
           }
         }
-        Column {
+        Text {
           anchors.right: parent.right
           anchors.rightMargin: 20
           anchors.verticalCenter: parent.verticalCenter
-          spacing: 2
-          Text {
-            anchors.right: parent.right
-            text: root.themeName.length > 0 ? root.themeName : "theme fallback"
-            color: appTheme.accent
-            font.family: appTheme.fontFamily
-            font.pixelSize: appTheme.fontSize - 1
-          }
-          Text {
-            anchors.right: parent.right
-            width: 420
-            horizontalAlignment: Text.AlignRight
-            elide: Text.ElideLeft
-            text: root.sessionNote.length > 0 ? root.sessionNote : (root.status.message || "")
-            color: root.status.state === "error" ? appTheme.red : appTheme.darkForeground
-            font.family: appTheme.fontFamily
-            font.pixelSize: appTheme.fontSize - 2
-          }
+          width: 420
+          horizontalAlignment: Text.AlignRight
+          elide: Text.ElideLeft
+          text: root.status.message || ""
+          color: root.status.state === "error" ? appTheme.red : appTheme.darkForeground
+          font.family: appTheme.fontFamily
+          font.pixelSize: appTheme.fontSize - 2
         }
       }
 
@@ -601,8 +904,7 @@ ShellRoot {
         anchors.top: header.bottom
         anchors.bottom: footer.top
         anchors.left: parent.left
-        anchors.right: parent.right
-        visible: !root.needLogin
+        anchors.right: chatSidebar.left
         theme: appTheme
         view: root.view
         metricIndex: root.metricIndex
@@ -615,12 +917,39 @@ ShellRoot {
         sample: (root.index && root.index.labeledSample) || root.sampleMode
         agentLabel: root.agentLabel()
         agentInstalled: root.agentIsInstalled()
+        gallery: root.gallery
+        focusId: root.chatFocusId
+        xrays: (root.library && root.library.xrays) ? root.library.xrays : []
+        blood: (root.library && root.library.blood) ? root.library.blood : []
+        urine: (root.library && root.library.urine) ? root.library.urine : []
         onRangeChosen: index => root.setRange(index)
-        onMetricChosen: index => root.metricIndex = index
+        onMetricChosen: index => {
+          root.metricIndex = index
+          root.gallery = ""
+        }
         onDayChosen: index => root.dayIndex = index
         onZoneChosen: name => {
           for (var i = 0; i < root.zones.length; i++) if (root.zones[i] === name) root.zoneIndex = i
         }
+        onSectionChosen: name => root.gallery = name
+        onDocumentChosen: (id, kind) => root.chatFocusId = id
+        onGalleryClosed: root.gallery = ""
+      }
+
+      Chat {
+        id: chatSidebar
+        anchors.top: header.bottom
+        anchors.bottom: footer.top
+        anchors.right: parent.right
+        width: 372
+        theme: appTheme
+        agentLabel: root.agentLabel()
+        busy: root.chatBusy
+        scope: root.chatScope
+        messages: root.chatMessages
+        onSendRequested: text => root.sendChat(text)
+        onScopeChosen: name => root.chatScope = name
+        onAgentRequested: root.openAgents()
       }
 
       Rectangle {
@@ -629,7 +958,6 @@ ShellRoot {
         anchors.left: parent.left
         anchors.right: parent.right
         height: 40
-        visible: !root.needLogin
         color: appTheme.darkerBackground
         border.width: root.zone === "agent" ? 2 : 0
         border.color: appTheme.accent
@@ -660,22 +988,111 @@ ShellRoot {
         }
       }
 
-      Login {
-        id: loginCard
+      MouseArea {
+        z: 10
         anchors.fill: parent
-        visible: root.needLogin
-        theme: appTheme
-        username: root.appleId
-        onSubmitCredentials: (username, password) => root.startLogin(username, password)
-        onSubmitCode: code => login.write(code + "\n")
-        onPreviewSample: root.useSample()
+        enabled: root.fileMenuOpen
+        onClicked: root.fileMenuOpen = false
       }
 
-      Help {
-        anchors.fill: parent
-        visible: root.helpOpen
-        theme: appTheme
-        onRequestClose: root.helpOpen = false
+      Rectangle {
+        id: fileMenu
+        visible: root.fileMenuOpen
+        z: 30
+        x: fileMenuButton.x
+        y: menuBar.height - 1
+        width: Math.max(240, importItem.implicitLabel + 28)
+        height: fileMenuCol.implicitHeight + 8
+        radius: 6
+        color: appTheme.darkBackground
+        border.color: appTheme.lighterBackground
+        border.width: 1
+
+        component FileAction: Rectangle {
+          id: action
+          property string label: ""
+          property bool rule: false
+          property int implicitLabel: actionText.implicitWidth
+          signal triggered()
+          width: fileMenuCol.width
+          height: rule ? 9 : 30
+          radius: 4
+          color: !rule && actionArea.containsMouse ? appTheme.selection : "transparent"
+          Rectangle {
+            visible: action.rule
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: 8
+            anchors.rightMargin: 8
+            height: 1
+            color: appTheme.lighterBackground
+          }
+          Text {
+            id: actionText
+            visible: !action.rule
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.left: parent.left
+            anchors.leftMargin: 12
+            text: action.label
+            color: appTheme.brightForeground
+            font.family: appTheme.fontFamily
+            font.pixelSize: appTheme.fontSize
+          }
+          MouseArea {
+            id: actionArea
+            anchors.fill: parent
+            enabled: !action.rule
+            hoverEnabled: true
+            cursorShape: action.rule ? Qt.ArrowCursor : Qt.PointingHandCursor
+            onClicked: action.triggered()
+          }
+        }
+
+        Column {
+          id: fileMenuCol
+          x: 4
+          y: 4
+          width: parent.width - 8
+          spacing: 2
+          FileAction {
+            label: "Settings"
+            onTriggered: root.openSettings()
+          }
+          FileAction {
+            label: "Keyboard"
+            onTriggered: root.openKeys()
+          }
+          FileAction {
+            label: "Switch person"
+            onTriggered: {
+              root.fileMenuOpen = false
+              root.sessionEntered = false
+            }
+          }
+          FileAction {
+            id: importItem
+            label: "Import from Apple HealthKit Export"
+            onTriggered: root.askImport("export")
+          }
+          FileAction {
+            label: "Import X-ray"
+            onTriggered: root.askImport("xray")
+          }
+          FileAction {
+            label: "Import Blood Test"
+            onTriggered: root.askImport("blood")
+          }
+          FileAction {
+            label: "Import Urine Test"
+            onTriggered: root.askImport("urine")
+          }
+          FileAction { rule: true }
+          FileAction {
+            label: "Close"
+            onTriggered: Qt.quit()
+          }
+        }
       }
 
       AgentPicker {
@@ -689,6 +1106,320 @@ ShellRoot {
         onRequestClose: root.agentOpen = false
         onCursorMoved: index => root.agentCursor = index
         onCommitRequested: root.commitAgent(true)
+      }
+
+      Rectangle {
+        visible: root.exportBusy
+        z: 60
+        anchors.fill: parent
+        color: Qt.rgba(0, 0, 0, 0.55)
+        MouseArea { anchors.fill: parent }
+
+        Timer {
+          id: importDotsTimer
+          interval: 400
+          repeat: true
+          running: false
+          property int step: 0
+          onTriggered: {
+            var marks = [".", "..", "..."]
+            step = (step + 1) % marks.length
+            root.importDots = marks[step]
+          }
+        }
+
+        Column {
+          anchors.centerIn: parent
+          spacing: 16
+
+          Item {
+            width: 56
+            height: 56
+            anchors.horizontalCenter: parent.horizontalCenter
+            RotationAnimation on rotation {
+              from: 0
+              to: 360
+              duration: 900
+              loops: Animation.Infinite
+              running: root.exportBusy
+            }
+            Canvas {
+              anchors.fill: parent
+              onPaint: {
+                var ctx = getContext("2d")
+                ctx.clearRect(0, 0, width, height)
+                var cx = width / 2
+                var cy = height / 2
+                var radius = 18
+                var end = Math.PI * 1.65
+                ctx.strokeStyle = appTheme.accent
+                ctx.fillStyle = appTheme.accent
+                ctx.lineWidth = 4
+                ctx.lineCap = "round"
+                ctx.beginPath()
+                ctx.arc(cx, cy, radius, 0.35, end)
+                ctx.stroke()
+                var x = cx + radius * Math.cos(end)
+                var y = cy + radius * Math.sin(end)
+                var tangent = end + Math.PI / 2
+                ctx.beginPath()
+                ctx.moveTo(x + 8 * Math.cos(tangent), y + 8 * Math.sin(tangent))
+                ctx.lineTo(x + 9 * Math.cos(end), y + 9 * Math.sin(end))
+                ctx.lineTo(x - 8 * Math.cos(tangent), y - 8 * Math.sin(tangent))
+                ctx.closePath()
+                ctx.fill()
+              }
+              Component.onCompleted: requestPaint()
+            }
+          }
+
+          Item {
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: importingLabel.implicitWidth + importingDotsWidth.implicitWidth
+            height: importingLabel.implicitHeight
+            Text {
+              id: importingLabel
+              text: "importing"
+              color: appTheme.brightForeground
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize + 2
+            }
+            Text {
+              id: importingDotsWidth
+              visible: false
+              text: "..."
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize + 2
+            }
+            Text {
+              anchors.left: importingLabel.right
+              text: root.importDots
+              color: appTheme.brightForeground
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize + 2
+            }
+          }
+        }
+      }
+
+      Rectangle {
+        visible: !root.sessionEntered
+        z: 80
+        anchors.fill: parent
+        color: Qt.rgba(0, 0, 0, 0.45)
+        onVisibleChanged: if (visible) personField.forceActiveFocus()
+
+        Rectangle {
+          anchors.centerIn: parent
+          width: 440
+          height: personCol.implicitHeight + 36
+          radius: 10
+          color: appTheme.darkBackground
+          border.width: 1
+          border.color: appTheme.lighterBackground
+
+          Column {
+            id: personCol
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 18
+            spacing: 12
+
+            Text {
+              width: parent.width
+              text: "Who is this for?"
+              color: appTheme.brightForeground
+              font.family: appTheme.fontFamily
+              font.pixelSize: 18
+              font.bold: true
+            }
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              text: "Each person keeps their own health data, X-rays, and lab results in this database."
+              color: appTheme.darkForeground
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize - 1
+            }
+            Text {
+              visible: !root.people || !root.people.users || root.people.users.length === 0
+              width: parent.width
+              wrapMode: Text.Wrap
+              text: "Add the first person to open the app."
+              color: appTheme.foreground
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize
+            }
+            Repeater {
+              model: (root.people && root.people.users) ? root.people.users : []
+              delegate: Rectangle {
+                required property var modelData
+                width: personCol.width
+                height: 36
+                radius: 6
+                color: root.people.current === modelData.id ? appTheme.selection : appTheme.darkerBackground
+                border.width: 1
+                border.color: root.people.current === modelData.id ? appTheme.accent : appTheme.lighterBackground
+                Text {
+                  anchors.fill: parent
+                  anchors.leftMargin: 12
+                  anchors.rightMargin: 12
+                  verticalAlignment: Text.AlignVCenter
+                  text: modelData.name
+                  color: appTheme.brightForeground
+                  font.family: appTheme.fontFamily
+                  font.pixelSize: appTheme.fontSize
+                  elide: Text.ElideRight
+                }
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  enabled: !personProc.running
+                  onClicked: root.enterPerson(modelData.id)
+                }
+              }
+            }
+            Row {
+              width: parent.width
+              spacing: 8
+              Rectangle {
+                width: parent.width - addPersonButton.width - 8
+                height: 36
+                radius: 6
+                color: appTheme.darkerBackground
+                border.width: 1
+                border.color: appTheme.lighterBackground
+                TextInput {
+                  id: personField
+                  anchors.fill: parent
+                  anchors.margins: 8
+                  clip: true
+                  color: appTheme.brightForeground
+                  font.family: appTheme.fontFamily
+                  font.pixelSize: appTheme.fontSize
+                  verticalAlignment: TextInput.AlignVCenter
+                  selectByMouse: true
+                  Keys.onReturnPressed: root.addPerson(text)
+                  Keys.onEnterPressed: root.addPerson(text)
+                }
+              }
+              Rectangle {
+                id: addPersonButton
+                width: 72
+                height: 36
+                radius: 6
+                color: addPersonArea.containsMouse ? Qt.lighter(appTheme.accent, 1.12) : appTheme.accent
+                Text {
+                  anchors.centerIn: parent
+                  text: "Add"
+                  color: appTheme.darkerBackground
+                  font.family: appTheme.fontFamily
+                  font.pixelSize: appTheme.fontSize - 1
+                  font.bold: true
+                }
+                MouseArea {
+                  id: addPersonArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.addPerson(personField.text)
+                }
+              }
+            }
+          }
+        }
+      }
+
+      Rectangle {
+        visible: root.pendingImport !== ""
+        z: 70
+        anchors.fill: parent
+        color: Qt.rgba(0, 0, 0, 0.45)
+
+        Rectangle {
+          anchors.centerIn: parent
+          width: 460
+          height: confirmCol.implicitHeight + 36
+          radius: 10
+          color: appTheme.darkBackground
+          border.width: 1
+          border.color: appTheme.lighterBackground
+
+          Column {
+            id: confirmCol
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 18
+            spacing: 16
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              text: root.importPrompt()
+              color: appTheme.brightForeground
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize + 2
+              font.bold: true
+            }
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              text: "The file is stored for " + root.activePersonName() + " only."
+              color: appTheme.foreground
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize
+            }
+            Row {
+              spacing: 10
+              Rectangle {
+                width: cancelImportLabel.implicitWidth + 28
+                height: 34
+                radius: 6
+                color: cancelImportArea.containsMouse ? appTheme.selection : appTheme.darkerBackground
+                border.width: 1
+                border.color: appTheme.lighterBackground
+                Text {
+                  id: cancelImportLabel
+                  anchors.centerIn: parent
+                  text: "Cancel"
+                  color: appTheme.foreground
+                  font.family: appTheme.fontFamily
+                  font.pixelSize: appTheme.fontSize
+                }
+                MouseArea {
+                  id: cancelImportArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.pendingImport = ""
+                }
+              }
+              Rectangle {
+                width: confirmImportLabel.implicitWidth + 28
+                height: 34
+                radius: 6
+                color: confirmImportArea.containsMouse ? Qt.lighter(appTheme.accent, 1.12) : appTheme.accent
+                Text {
+                  id: confirmImportLabel
+                  anchors.centerIn: parent
+                  text: "Import"
+                  color: appTheme.darkerBackground
+                  font.family: appTheme.fontFamily
+                  font.pixelSize: appTheme.fontSize
+                  font.bold: true
+                }
+                MouseArea {
+                  id: confirmImportArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.confirmImport()
+                }
+              }
+            }
+          }
+        }
       }
 
       Rectangle {
@@ -728,6 +1459,42 @@ ShellRoot {
           onTriggered: toast.opacity = 0
         }
       }
+    }
+  }
+
+  FloatingWindow {
+    id: settingsWin
+    visible: root.settingsOpen
+    title: "OHealth Settings"
+    parentWindow: win
+    implicitWidth: 560
+    implicitHeight: 380
+    color: appTheme.background
+    onVisibleChanged: if (visible) settingsPanel.forceActiveFocus()
+    Settings {
+      id: settingsPanel
+      anchors.fill: parent
+      theme: appTheme
+      databasePath: root.databasePath
+      onRequestClose: root.closeSettings()
+      onRequestChoose: root.chooseDatabase()
+    }
+  }
+
+  FloatingWindow {
+    id: keysWin
+    visible: root.keysOpen
+    title: "OHealth Keyboard"
+    parentWindow: win
+    implicitWidth: 720
+    implicitHeight: 640
+    color: appTheme.background
+    onVisibleChanged: if (visible) keysPanel.forceActiveFocus()
+    Help {
+      id: keysPanel
+      anchors.fill: parent
+      theme: appTheme
+      onRequestClose: root.closeKeys()
     }
   }
 }
