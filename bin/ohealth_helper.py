@@ -19,6 +19,7 @@ part of the iCloud web API that pyicloud speaks.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import os
@@ -44,6 +45,25 @@ def fail(message: str, **extra) -> None:
     logging.getLogger().error("fail: %s", message)
     emit({"ok": False, "error": message, **extra})
     sys.exit(1)
+
+
+TERMS_ERROR = (
+    "Apple needs the updated iCloud terms accepted before sign-in can finish. "
+    "Open icloud.com, accept them, and try again."
+)
+
+
+def needs_terms(exc: BaseException) -> bool:
+    """True when Apple blocked the session on an updated terms prompt."""
+    if type(exc).__name__ == "PyiCloudAcceptTermsException":
+        return True
+    return "accept the updated terms" in str(exc).lower()
+
+
+def fail_apple(exc: BaseException, fallback: str) -> None:
+    if needs_terms(exc):
+        fail(TERMS_ERROR)
+    fail(fallback)
 
 
 def import_service():
@@ -90,18 +110,40 @@ def import_service():
         return None, None, None
 
 
+def construct(service_cls, args: tuple, options: dict):
+    """Build a pyicloud service, skipping keywords this build does not take.
+
+    Current pyicloud raises until accept_terms=True, which is the library's
+    --accept-terms switch. Older builds, and pyicloud_ipd, reject that name.
+    """
+    try:
+        params = inspect.signature(service_cls).parameters
+    except (TypeError, ValueError):
+        params = None
+    if params is None:
+        try:
+            return service_cls(*args, **options)
+        except TypeError:
+            slim = {key: value for key, value in options.items() if key != "accept_terms"}
+            try:
+                return service_cls(*args, **slim)
+            except TypeError:
+                return service_cls(*args)
+    if not any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        options = {key: value for key, value in options.items() if key in params}
+    return service_cls(*args, **options)
+
+
 def connect(backend: str, service_cls, username: str, password_fn, cookies: str):
     Path(cookies).mkdir(parents=True, exist_ok=True)
     os.chmod(cookies, 0o700)
+    options = {"cookie_directory": cookies, "accept_terms": True}
     if backend == "pyicloud_ipd":
         # Country "com", password fetched by the library only if the session
         # is missing. Calling authenticate() again would be a second sign-in.
-        return service_cls("com", username, password_fn, cookie_directory=cookies)
+        return construct(service_cls, ("com", username, password_fn), options)
     password = password_fn() if password_fn else None
-    try:
-        return service_cls(username, password, cookie_directory=cookies)
-    except TypeError:
-        return service_cls(username, password)
+    return construct(service_cls, (username, password), options)
 
 
 def cmd_login(args) -> None:
@@ -134,9 +176,9 @@ def cmd_login(args) -> None:
     except errors["connection"]:
         fail("Could not reach iCloud. Check the connection and try again.")
     except errors["base"] as exc:
-        fail(f"Apple did not accept the login: {exc}")
+        fail_apple(exc, f"Apple did not accept the login: {exc}")
     except Exception as exc:  # noqa: BLE001
-        fail(f"Apple did not accept the login: {exc}")
+        fail_apple(exc, f"Apple did not accept the login: {exc}")
 
     if getattr(api, "requires_2fa", False):
         try:
@@ -151,7 +193,9 @@ def cmd_login(args) -> None:
         try:
             accepted = api.validate_2fa_code(code)
         except Exception as exc:  # noqa: BLE001
-            fail(f"Apple did not accept that code: {exc}")
+            # trust_session() runs inside validate_2fa_code and is where
+            # current pyicloud raises if Apple's terms still need accepting.
+            fail_apple(exc, f"Apple did not accept that code: {exc}")
         if not accepted:
             fail("Apple did not accept that code")
         if hasattr(api, "trust_session"):
@@ -210,6 +254,8 @@ def cmd_probe() -> None:
     except errors["connection"]:
         fail("Could not reach iCloud. Check the connection and try again.")
     except Exception as exc:  # noqa: BLE001
+        if needs_terms(exc):
+            fail(TERMS_ERROR)
         text = str(exc).lower()
         if "2fa" in text or "two-factor" in text or "required" in text:
             fail("iCloud session expired. Sign in again.")

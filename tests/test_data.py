@@ -238,6 +238,63 @@ def test_helper_status_logout_and_missing_pyicloud(tmp: Path) -> None:
     assert note["cookiesKept"] is True
 
 
+def test_connect_passes_accept_terms_when_supported(tmp: Path) -> None:
+    env = isolate(tmp)
+    for key, value in env.items():
+        if key.startswith(("OHEALTH", "XDG", "HOME")):
+            os.environ[key] = value
+    sys.path.insert(0, str(BIN))
+    import importlib
+    import ohealth_helper
+    importlib.reload(ohealth_helper)
+
+    seen: dict = {}
+
+    class Current:
+        def __init__(self, username, password=None, cookie_directory=None, accept_terms=False):
+            seen["current"] = {
+                "username": username,
+                "password": password,
+                "cookie_directory": cookie_directory,
+                "accept_terms": accept_terms,
+            }
+
+    class Vendored:
+        def __init__(self, domain, username, password_fn, cookie_directory=None):
+            seen["vendored"] = {
+                "domain": domain,
+                "username": username,
+                "password": password_fn(),
+                "cookie_directory": cookie_directory,
+            }
+
+    class Ancient:
+        def __init__(self, username, password=None):
+            seen["ancient"] = {"username": username, "password": password}
+
+    cookies = tmp / "cookies"
+    ohealth_helper.connect("pyicloud", Current, "person@icloud.com", lambda: "secret", str(cookies))
+    assert seen["current"]["accept_terms"] is True
+    assert seen["current"]["cookie_directory"] == str(cookies)
+    assert seen["current"]["password"] == "secret"
+    assert cookies.is_dir()
+
+    ohealth_helper.connect("pyicloud_ipd", Vendored, "person@icloud.com", lambda: "secret", str(cookies))
+    assert seen["vendored"]["domain"] == "com"
+    assert seen["vendored"]["cookie_directory"] == str(cookies)
+    assert "accept_terms" not in seen["vendored"]
+
+    ohealth_helper.connect("pyicloud", Ancient, "person@icloud.com", lambda: "secret", str(cookies))
+    assert seen["ancient"]["password"] == "secret"
+
+    terms = type("PyiCloudAcceptTermsException", (Exception,), {})
+    assert ohealth_helper.needs_terms(terms("Could not get terms version"))
+    assert ohealth_helper.needs_terms(
+        Exception("You must accept the updated terms of service to continue.")
+    )
+    assert not ohealth_helper.needs_terms(Exception("wrong code"))
+
+
 def test_agent_picker_writes_omarchy_file(tmp: Path) -> None:
     env = isolate(tmp)
     listed = run(env, "ohealth_agent.py", ["list"])
@@ -302,6 +359,7 @@ def main() -> None:
         test_health_auto_export_json,
         test_missing_export_is_an_error,
         test_helper_status_logout_and_missing_pyicloud,
+        test_connect_passes_accept_terms_when_supported,
         test_agent_picker_writes_omarchy_file,
     ]
     failed = 0

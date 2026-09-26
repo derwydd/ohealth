@@ -47,6 +47,8 @@ Sign-in matches [Omarchy iCloud Photos](https://github.com/jankeesvw/omarchy-icl
 
 That session proves the Apple ID and is there so this app sits on the same auth bridge as iCloud Photos. It is not a HealthKit download. After you are signed in, the window still needs the export in the inbox. If the session expires, the sign-in card comes back. `shift+r` checks the session once.
 
+Current pyicloud refuses the session until Apple's updated terms are accepted. Sign-in passes the library's `accept_terms` flag, the same switch as `icloud auth login --accept-terms`. Older pyicloud builds ignore that flag; if Apple still blocks the account, accept the terms at icloud.com and sign in again.
+
 This checkout already has a `.venv` with pyicloud installed, and the helper scripts use it when it is present. `install.sh` creates that virtualenv if it is missing. If the import fails, the card says sign-in is unavailable. Sample data and a local export still load.
 
 ## Theme

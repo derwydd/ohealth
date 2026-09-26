@@ -124,7 +124,7 @@ Item {
         wrapMode: Text.Wrap
         text: root.step === "code"
           ? "Apple sent a six-digit code to your trusted devices. It confirms the iCloud session. It does not download HealthKit."
-          : "Apple ID and password open an iCloud session, the same cookie jar Omarchy iCloud Photos uses. The password is not stored. Health data still has to come from an export on this machine."
+          : "Apple ID and password open an iCloud session, the same cookie jar Omarchy iCloud Photos uses. The password is not stored. Signing in accepts updated iCloud terms when Apple requires them. Health data still has to come from an export on this machine."
         color: theme.darkForeground
         font.family: theme.fontFamily
         font.pixelSize: theme.fontSize - 1
