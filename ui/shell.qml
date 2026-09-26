@@ -65,6 +65,8 @@ ShellRoot {
   property bool sessionEntered: false
   property bool sampleOnNextEnter: false
   property string pendingImport: ""
+  property string pendingDelete: ""
+  property string pendingDeleteName: ""
   property string colorRaw: ""
   property string themeShellRaw: ""
   property string machineShellRaw: ""
@@ -163,6 +165,7 @@ ShellRoot {
   }
 
   function setRange(index) {
+    classifyHold = false
     rangeIndex = Math.max(0, Math.min(rangeIds.length - 1, index))
     customActive = false
     rebuild()
@@ -325,6 +328,23 @@ ShellRoot {
     usersProc.running = true
   }
 
+  function askDelete(id, name) {
+    if (!id || usersProc.running || pendingDelete) return
+    pendingDelete = id
+    pendingDeleteName = String(name || "this person")
+    personField.focus = false
+    keys.forceActiveFocus()
+  }
+
+  function confirmDelete() {
+    var id = pendingDelete
+    pendingDelete = ""
+    pendingDeleteName = ""
+    if (!id || usersProc.running) return
+    usersProc.command = [syncScript, "--delete-user", id]
+    usersProc.running = true
+  }
+
   function enterPerson(id) {
     if (!id || personProc.running) return
     var args = [syncScript, "--user", id]
@@ -475,6 +495,16 @@ ShellRoot {
     askProc.running = true
   }
 
+  readonly property var severityColors: (index && index.severity && index.severity.colors)
+    ? index.severity.colors
+    : ({ severe: "#f7768e", alert: "#ff9e64", mild: "#e0af68", normal: "#9ece6a" })
+  readonly property bool classifyAuto: !(index && index.severity) || index.severity.auto !== false
+  readonly property bool classifyAll: !!(index && index.severity && index.severity.classifyAll)
+  property bool classifyHold: false
+  property bool classifyBusy: false
+  property bool classifyCancel: false
+  property string classifyNext: ""
+
   function applyIndex(raw) {
     try { index = JSON.parse(raw) } catch (e) { return }
     var first = !placedDay
@@ -483,6 +513,72 @@ ShellRoot {
       var days = (view && view.days) ? view.days : []
       if (days.length > 0) placedDay = true
     }
+    classifySoon.restart()
+  }
+
+  function missingSelectionPoints() {
+    var metrics = (view && view.metrics) ? view.metrics : []
+    var metric = (metricIndex >= 0 && metricIndex < metrics.length) ? metrics[metricIndex] : null
+    var days = (view && view.days) ? view.days : []
+    if (!metric || !metric.series) return []
+    var levels = metric.seriesLevel || []
+    var points = []
+    for (var i = metric.series.length - 1; i >= 0 && points.length < 40; i--) {
+      var value = metric.series[i]
+      if (value === null || value === undefined) continue
+      if (levels[i]) continue
+      points.push({ date: days[i], value: value })
+    }
+    points.reverse()
+    return points
+  }
+
+  function startSelection(payload) {
+    classifyBusy = true
+    classifyTimeout.restart()
+    classifyProc.mode = "selection"
+    classifyProc.payload = payload
+    classifyProc.command = [agentScript, "classify"]
+    classifyProc.running = true
+  }
+
+  function queueClassification() {
+    if (!sessionEntered || classifyHold || classifyAll || !classifyAuto) return
+    var points = missingSelectionPoints()
+    if (!points.length) return
+    var metrics = view.metrics
+    var metric = metrics[metricIndex]
+    var payload = JSON.stringify({
+      field: metric.id,
+      metric: metric.name,
+      unit: metric.unit || "count",
+      sample: !!(index && index.labeledSample) || sampleMode,
+      points: points
+    })
+    if (classifyProc.running) {
+      if (classifyProc.payload === payload) return
+      classifyNext = payload
+      classifyCancel = true
+      classifyProc.running = false
+      return
+    }
+    startSelection(payload)
+  }
+
+  function queueBackground() {
+    if (!sessionEntered || classifyBusy || classifyHold || !classifyAll) return
+    classifyBusy = true
+    classifyProc.mode = "all"
+    classifyProc.payload = ""
+    classifyProc.command = [agentScript, "classify", "--pending", "--limit", "40"]
+    classifyProc.running = true
+  }
+
+  function saveSeverity(patch) {
+    if (severityProc.running) return
+    severityProc.payload = JSON.stringify(patch || {})
+    severityProc.command = [syncScript, "--severity-config"]
+    severityProc.running = true
   }
 
   FileView {
@@ -597,6 +693,72 @@ ShellRoot {
       usersFile.reload()
       if (exitCode !== 0) toast.show(String(usersErr.text || "").trim() || "Could not update people")
       else if (usersProc.command.length > 1 && usersProc.command[1] === "--add-user") personField.text = ""
+    }
+  }
+  Timer {
+    id: classifySoon
+    interval: 300
+    onTriggered: root.queueClassification()
+  }
+  Timer {
+    id: classifyTimeout
+    interval: 45000
+    onTriggered: {
+      if (!classifyProc.running) return
+      root.classifyNext = ""
+      root.classifyCancel = true
+      root.classifyHold = true
+      classifyProc.running = false
+      toast.show("The agent took too long to classify this chart")
+    }
+  }
+  Timer {
+    id: classifyAllTimer
+    interval: 800
+    repeat: true
+    running: root.sessionEntered && root.classifyAll && !root.classifyHold && !root.classifyBusy
+    onTriggered: root.queueBackground()
+  }
+  Process {
+    id: classifyProc
+    running: false
+    stdinEnabled: true
+    property string payload: ""
+    property string mode: "selection"
+    stdout: StdioCollector { id: classifyOut }
+    stderr: StdioCollector { id: classifyErr }
+    onStarted: if (mode === "selection" && payload) write(payload + "\n")
+    onExited: (exitCode) => {
+      classifyTimeout.stop()
+      root.classifyBusy = false
+      if (root.classifyCancel) {
+        root.classifyCancel = false
+        var next = root.classifyNext
+        root.classifyNext = ""
+        if (next) root.startSelection(next)
+        return
+      }
+      var msg = {}
+      try { msg = JSON.parse(classifyOut.text) } catch (e) { msg = {} }
+      if (exitCode !== 0 || msg.ok === false) {
+        root.classifyHold = true
+        toast.show(String(msg.error || classifyErr.text || "Could not classify this chart").trim())
+        return
+      }
+      classifyAllTimer.interval = msg.done ? 8000 : 500
+      indexFile.reload()
+    }
+  }
+  Process {
+    id: severityProc
+    running: false
+    stdinEnabled: true
+    property string payload: ""
+    stderr: StdioCollector { id: severityErr }
+    onStarted: write(payload + "\n")
+    onExited: (exitCode) => {
+      if (exitCode !== 0) toast.show(String(severityErr.text || "").trim() || "Could not save severity settings")
+      else indexFile.reload()
     }
   }
   Process {
@@ -821,6 +983,14 @@ ShellRoot {
           event.accepted = true
           return
         }
+        if (root.pendingDelete) {
+          if (k === Qt.Key_Escape) {
+            root.pendingDelete = ""
+            root.pendingDeleteName = ""
+          } else if (k === Qt.Key_Return || k === Qt.Key_Enter) root.confirmDelete()
+          event.accepted = true
+          return
+        }
         if (root.pendingImport) {
           if (k === Qt.Key_Escape) root.pendingImport = ""
           else if (k === Qt.Key_Return || k === Qt.Key_Enter) root.confirmImport()
@@ -1013,9 +1183,13 @@ ShellRoot {
         urine: (root.library && root.library.urine) ? root.library.urine : []
         onRangeChosen: index => root.setRange(index)
         onCustomRangeChosen: (start, end) => root.saveCustomRange(start, end)
+        severityColors: root.severityColors
+        classifying: root.classifyBusy
         onMetricChosen: index => {
+          root.classifyHold = false
           root.metricIndex = index
           root.gallery = ""
+          classifySoon.restart()
         }
         onDayChosen: index => root.dayIndex = index
         onZoneChosen: name => {
@@ -1115,27 +1289,31 @@ ShellRoot {
 
       Rectangle {
         id: fileMenu
+        property bool importMenuOpen: false
         visible: root.fileMenuOpen
         z: 30
         x: fileMenuButton.x
         y: menuBar.height - 1
-        width: Math.max(240, importItem.implicitLabel + 28)
+        width: Math.max(200, personItem.implicitLabel + 36, importItem.implicitLabel + 44)
         height: fileMenuCol.implicitHeight + 8
         radius: 6
         color: appTheme.darkBackground
         border.color: appTheme.lighterBackground
         border.width: 1
+        onVisibleChanged: if (!visible) importMenuOpen = false
 
         component FileAction: Rectangle {
           id: action
           property string label: ""
           property bool rule: false
+          property bool opensMenu: false
+          property bool inSubmenu: false
           property int implicitLabel: actionText.implicitWidth
           signal triggered()
-          width: fileMenuCol.width
+          width: parent.width
           height: rule ? 9 : 30
           radius: 4
-          color: !rule && actionArea.containsMouse ? appTheme.selection : "transparent"
+          color: !rule && (actionArea.containsMouse || (action.opensMenu && fileMenu.importMenuOpen)) ? appTheme.selection : "transparent"
           Rectangle {
             visible: action.rule
             anchors.verticalCenter: parent.verticalCenter
@@ -1152,10 +1330,24 @@ ShellRoot {
             anchors.verticalCenter: parent.verticalCenter
             anchors.left: parent.left
             anchors.leftMargin: 12
+            anchors.right: action.opensMenu ? menuArrow.left : parent.right
+            anchors.rightMargin: action.opensMenu ? 6 : 12
             text: action.label
             color: appTheme.brightForeground
             font.family: appTheme.fontFamily
             font.pixelSize: appTheme.fontSize
+            elide: Text.ElideRight
+          }
+          Text {
+            id: menuArrow
+            visible: action.opensMenu
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.right: parent.right
+            anchors.rightMargin: 10
+            text: "›"
+            color: appTheme.foreground
+            font.family: appTheme.fontFamily
+            font.pixelSize: appTheme.fontSize + 2
           }
           MouseArea {
             id: actionArea
@@ -1163,6 +1355,7 @@ ShellRoot {
             enabled: !action.rule
             hoverEnabled: true
             cursorShape: action.rule ? Qt.ArrowCursor : Qt.PointingHandCursor
+            onEntered: if (!action.inSubmenu) fileMenu.importMenuOpen = action.opensMenu
             onClicked: action.triggered()
           }
         }
@@ -1182,6 +1375,7 @@ ShellRoot {
             onTriggered: root.openKeys()
           }
           FileAction {
+            id: personItem
             label: "Switch person"
             onTriggered: {
               root.fileMenuOpen = false
@@ -1190,25 +1384,57 @@ ShellRoot {
           }
           FileAction {
             id: importItem
-            label: "Import from Apple HealthKit Export"
-            onTriggered: root.askImport("export")
-          }
-          FileAction {
-            label: "Import X-ray"
-            onTriggered: root.askImport("xray")
-          }
-          FileAction {
-            label: "Import Blood Test"
-            onTriggered: root.askImport("blood")
-          }
-          FileAction {
-            label: "Import Urine Test"
-            onTriggered: root.askImport("urine")
+            label: "Import"
+            opensMenu: true
+            onTriggered: fileMenu.importMenuOpen = true
           }
           FileAction { rule: true }
           FileAction {
             label: "Close"
             onTriggered: Qt.quit()
+          }
+        }
+
+        Rectangle {
+          id: importMenu
+          visible: fileMenu.importMenuOpen
+          z: 2
+          x: parent.width - 6
+          y: fileMenuCol.y + importItem.y - 4
+          width: Math.max(240, healthImport.implicitLabel + 28)
+          height: importMenuCol.implicitHeight + 8
+          radius: 6
+          color: appTheme.darkBackground
+          border.color: appTheme.lighterBackground
+          border.width: 1
+
+          Column {
+            id: importMenuCol
+            x: 4
+            y: 4
+            width: parent.width - 8
+            spacing: 2
+            FileAction {
+              id: healthImport
+              label: "Apple HealthKit Export"
+              inSubmenu: true
+              onTriggered: root.askImport("export")
+            }
+            FileAction {
+              label: "X-ray"
+              inSubmenu: true
+              onTriggered: root.askImport("xray")
+            }
+            FileAction {
+              label: "Blood Test"
+              inSubmenu: true
+              onTriggered: root.askImport("blood")
+            }
+            FileAction {
+              label: "Urine Test"
+              inSubmenu: true
+              onTriggered: root.askImport("urine")
+            }
           }
         }
       }
@@ -1379,22 +1605,50 @@ ShellRoot {
                 color: root.people.current === modelData.id ? appTheme.selection : appTheme.darkerBackground
                 border.width: 1
                 border.color: root.people.current === modelData.id ? appTheme.accent : appTheme.lighterBackground
-                Text {
+                MouseArea {
                   anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  enabled: !personProc.running && !usersProc.running
+                  onClicked: root.enterPerson(modelData.id)
+                }
+                Text {
+                  anchors.left: parent.left
+                  anchors.right: removePerson.left
                   anchors.leftMargin: 12
-                  anchors.rightMargin: 12
-                  verticalAlignment: Text.AlignVCenter
+                  anchors.rightMargin: 8
+                  anchors.verticalCenter: parent.verticalCenter
                   text: modelData.name
                   color: appTheme.brightForeground
                   font.family: appTheme.fontFamily
                   font.pixelSize: appTheme.fontSize
                   elide: Text.ElideRight
                 }
-                MouseArea {
-                  anchors.fill: parent
-                  cursorShape: Qt.PointingHandCursor
-                  enabled: !personProc.running
-                  onClicked: root.enterPerson(modelData.id)
+                Rectangle {
+                  id: removePerson
+                  z: 1
+                  anchors.right: parent.right
+                  anchors.rightMargin: 6
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: 24
+                  height: 24
+                  radius: 4
+                  color: removePersonArea.containsMouse ? appTheme.selection : "transparent"
+                  Text {
+                    anchors.centerIn: parent
+                    text: "−"
+                    color: appTheme.red
+                    font.family: appTheme.fontFamily
+                    font.pixelSize: appTheme.fontSize + 4
+                    font.bold: true
+                  }
+                  MouseArea {
+                    id: removePersonArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: !personProc.running && !usersProc.running
+                    onClicked: root.askDelete(modelData.id, modelData.name)
+                  }
                 }
               }
             }
@@ -1442,6 +1696,102 @@ ShellRoot {
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
                   onClicked: root.addPerson(personField.text)
+                }
+              }
+            }
+          }
+        }
+      }
+
+      Rectangle {
+        visible: root.pendingDelete !== ""
+        z: 90
+        anchors.fill: parent
+        color: Qt.rgba(0, 0, 0, 0.45)
+        MouseArea { anchors.fill: parent }
+
+        Rectangle {
+          z: 1
+          anchors.centerIn: parent
+          width: 460
+          height: deleteCol.implicitHeight + 36
+          radius: 10
+          color: appTheme.darkBackground
+          border.width: 1
+          border.color: appTheme.lighterBackground
+
+          Column {
+            id: deleteCol
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 18
+            spacing: 16
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              text: "Remove " + root.pendingDeleteName + "?"
+              color: appTheme.brightForeground
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize + 2
+              font.bold: true
+            }
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              text: "This deletes their health data, X-rays, lab results, and chat."
+              color: appTheme.foreground
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize
+            }
+            Row {
+              spacing: 10
+              Rectangle {
+                width: cancelDeleteLabel.implicitWidth + 28
+                height: 34
+                radius: 6
+                color: cancelDeleteArea.containsMouse ? appTheme.selection : appTheme.darkerBackground
+                border.width: 1
+                border.color: appTheme.lighterBackground
+                Text {
+                  id: cancelDeleteLabel
+                  anchors.centerIn: parent
+                  text: "Cancel"
+                  color: appTheme.foreground
+                  font.family: appTheme.fontFamily
+                  font.pixelSize: appTheme.fontSize
+                }
+                MouseArea {
+                  id: cancelDeleteArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.pendingDelete = ""
+                    root.pendingDeleteName = ""
+                  }
+                }
+              }
+              Rectangle {
+                width: confirmDeleteLabel.implicitWidth + 28
+                height: 34
+                radius: 6
+                color: confirmDeleteArea.containsMouse ? Qt.lighter(appTheme.red, 1.12) : appTheme.red
+                Text {
+                  id: confirmDeleteLabel
+                  anchors.centerIn: parent
+                  text: "Remove"
+                  color: appTheme.darkerBackground
+                  font.family: appTheme.fontFamily
+                  font.pixelSize: appTheme.fontSize
+                  font.bold: true
+                }
+                MouseArea {
+                  id: confirmDeleteArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.confirmDelete()
                 }
               }
             }
@@ -1586,7 +1936,7 @@ ShellRoot {
     title: "OHealth Settings"
     parentWindow: win
     implicitWidth: 560
-    implicitHeight: 380
+    implicitHeight: 680
     color: appTheme.background
     onVisibleChanged: if (visible) settingsPanel.forceActiveFocus()
     Settings {
@@ -1594,8 +1944,26 @@ ShellRoot {
       anchors.fill: parent
       theme: appTheme
       databasePath: root.databasePath
+      colors: root.severityColors
+      classifyAuto: root.classifyAuto
+      classifyAll: root.classifyAll
       onRequestClose: root.closeSettings()
       onRequestChoose: root.chooseDatabase()
+      onColorsChosen: (severe, alert, mild, normal) => root.saveSeverity({
+        severe: severe,
+        alert: alert,
+        mild: mild,
+        normal: normal
+      })
+      onClassifyAutoChosen: enabled => {
+        root.classifyHold = false
+        root.saveSeverity({ auto: enabled })
+      }
+      onClassifyAllChosen: enabled => {
+        root.classifyHold = false
+        classifyAllTimer.interval = 800
+        root.saveSeverity({ classifyAll: enabled })
+      }
     }
   }
 

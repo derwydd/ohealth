@@ -259,6 +259,18 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS chat_user ON chat(user_id)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS severity (
+          user_id TEXT NOT NULL,
+          field TEXT NOT NULL,
+          date TEXT NOT NULL,
+          value TEXT NOT NULL,
+          level TEXT NOT NULL,
+          PRIMARY KEY (user_id, field, date)
+        )
+        """
+    )
 
 
 def _needs_owner(conn: sqlite3.Connection) -> bool:
@@ -534,6 +546,57 @@ def add_user(name: str) -> dict:
         conn.close()
     publish_users()
     return {"id": uid, "name": cleaned}
+
+
+def _path_is_inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _remove_person_files(user_id: str, paths: list[str]) -> None:
+    if not user_id or user_id in {".", ".."} or "/" in user_id or "\\" in user_id:
+        return
+    roots = (xray_dir(), document_dir())
+    for raw in paths:
+        candidate = Path(raw)
+        if any(_path_is_inside(candidate, root) for root in roots) and candidate.is_file():
+            candidate.unlink()
+    for folder in (xray_dir() / user_id, document_dir() / user_id):
+        if folder.is_dir():
+            shutil.rmtree(folder)
+
+
+def delete_user(user_id: str) -> bool:
+    """Remove one person, their health rows, chat, and imported files.
+
+    Returns True when that person was the one the database was opened as.
+    """
+    conn = connect_db()
+    paths: list[str] = []
+    was_current = False
+    uid = ""
+    try:
+        row = conn.execute("SELECT id FROM users WHERE id = ?", (user_id.strip(),)).fetchone()
+        if row is None:
+            raise ValueError("That person is not in this database.")
+        uid = row["id"]
+        paths = [item["path"] for item in conn.execute("SELECT path FROM files WHERE user_id = ?", (uid,))]
+        current = current_user_row(conn)
+        was_current = current is not None and current["id"] == uid
+        for table in ("days", "samples", "user_meta", "files", "chat", "severity"):
+            conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (uid,))
+        conn.execute("DELETE FROM users WHERE id = ?", (uid,))
+        if was_current:
+            conn.execute("DELETE FROM meta WHERE key = 'user'")
+        conn.commit()
+    finally:
+        conn.close()
+    _remove_person_files(uid, paths)
+    publish_users()
+    return was_current
 
 
 def set_current_user(user_id: str) -> None:
@@ -986,6 +1049,181 @@ def aggregate(rows: list[dict], field: str, kind: str) -> float | None:
     return sum(values) / len(values)
 
 
+SEVERITY_LEVELS = ("severe", "alert", "mild", "normal")
+DEFAULT_SEVERITY_COLORS = {
+    "severe": "#f7768e",
+    "alert": "#ff9e64",
+    "mild": "#e0af68",
+    "normal": "#9ece6a",
+}
+_SEVERITY_COLOR_KEYS = {
+    "severe": "severitySevere",
+    "alert": "severityAlert",
+    "mild": "severityMild",
+    "normal": "severityNormal",
+}
+
+
+def severity_value_key(value: float) -> str:
+    return f"{float(value):.4f}"
+
+
+def normalize_hex(color: str) -> str:
+    text = str(color or "").strip()
+    if len(text) == 4 and text.startswith("#"):
+        text = "#" + "".join(ch * 2 for ch in text[1:])
+    if len(text) != 7 or not text.startswith("#") or any(ch not in "0123456789abcdefABCDEF" for ch in text[1:]):
+        raise ValueError("Use a color like #f7768e.")
+    return text.lower()
+
+
+def severity_settings() -> dict:
+    """Palette and classification switches. Missing keys use the defaults."""
+    conn = connect_db()
+    try:
+        stored = {
+            row["key"]: row["value"]
+            for row in conn.execute(
+                "SELECT key, value FROM meta WHERE key IN ('severitySevere', 'severityAlert', 'severityMild', 'severityNormal', 'severityAuto', 'severityAll')"
+            )
+        }
+    finally:
+        conn.close()
+    colors = {}
+    for level, key in _SEVERITY_COLOR_KEYS.items():
+        raw = stored.get(key) or ""
+        try:
+            colors[level] = normalize_hex(raw) if raw else DEFAULT_SEVERITY_COLORS[level]
+        except ValueError:
+            colors[level] = DEFAULT_SEVERITY_COLORS[level]
+    return {
+        "colors": colors,
+        "auto": stored.get("severityAuto", "1") != "0",
+        "classifyAll": stored.get("severityAll", "0") == "1",
+    }
+
+
+def apply_severity_config(patch: dict) -> dict:
+    current = severity_settings()
+    colors = dict(current["colors"])
+    incoming = patch.get("colors") if isinstance(patch.get("colors"), dict) else patch
+    for level in SEVERITY_LEVELS:
+        if level in incoming and incoming[level]:
+            colors[level] = normalize_hex(incoming[level])
+    auto = current["auto"] if "auto" not in patch else bool(patch["auto"])
+    classify_all = current["classifyAll"] if "classifyAll" not in patch else bool(patch["classifyAll"])
+    conn = connect_db()
+    try:
+        rows = [(key, colors[level]) for level, key in _SEVERITY_COLOR_KEYS.items()]
+        rows.append(("severityAuto", "1" if auto else "0"))
+        rows.append(("severityAll", "1" if classify_all else "0"))
+        conn.executemany(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return severity_settings()
+
+
+def load_severity_map(user_id: str) -> dict[tuple[str, str], tuple[str, str]]:
+    if not user_id:
+        return {}
+    conn = connect_db()
+    try:
+        rows = conn.execute(
+            "SELECT field, date, value, level FROM severity WHERE user_id = ?",
+            (user_id,),
+        )
+        return {(row["field"], row["date"]): (row["value"], row["level"]) for row in rows}
+    finally:
+        conn.close()
+
+
+def save_severity(user_id: str, field: str, items: list[dict]) -> int:
+    if field not in DAY_FIELDS:
+        raise ValueError("Unknown health metric.")
+    saved = 0
+    conn = connect_db()
+    try:
+        for item in items:
+            level = str(item.get("level") or "").strip().lower()
+            if level not in SEVERITY_LEVELS:
+                continue
+            day = str(item.get("date") or "").strip()
+            if not day:
+                continue
+            try:
+                key = severity_value_key(float(item["value"]))
+            except (TypeError, ValueError):
+                continue
+            conn.execute(
+                "INSERT INTO severity (user_id, field, date, value, level) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, field, date) DO UPDATE SET value = excluded.value, level = excluded.level",
+                (user_id, field, day, key, level),
+            )
+            saved += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return saved
+
+
+def next_unclassified(limit: int = 40) -> dict | None:
+    """The next stored days the agent has not classified for the current person."""
+    conn = connect_db()
+    try:
+        person = current_user_row(conn)
+    finally:
+        conn.close()
+    if person is None:
+        return None
+    stored = load_severity_map(person["id"])
+    rows, _meta = load_days()
+    names = {spec["id"]: spec for spec in METRICS}
+    pending: dict[str, list[dict]] = {spec["id"]: [] for spec in METRICS}
+    for row in reversed(rows):
+        for spec in METRICS:
+            field = spec["id"]
+            value = row.get(field)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            key = severity_value_key(float(value))
+            previous = stored.get((field, row["date"]))
+            if previous and previous[0] == key:
+                continue
+            pending[field].append({"date": row["date"], "value": float(value)})
+    for spec in METRICS:
+        points = pending[spec["id"]][: max(1, limit)]
+        if not points:
+            continue
+        unit = "" if spec["unit"] == "count" else spec["unit"]
+        return {
+            "field": spec["id"],
+            "metric": names[spec["id"]]["name"],
+            "unit": unit or "count",
+            "points": points,
+        }
+    return None
+
+
+def republish_current() -> None:
+    """Rewrite index.json from sqlite, including stored severity colors."""
+    apple_id = read_config().get("APPLE_ID", "")
+    uid, _name = current_person()
+    if not uid:
+        return
+    rows, meta = load_days()
+    if meta.get("stored") != "1":
+        detail = meta.get("sourceDetail") or EMPTY_DETAIL
+        write_json(index_path(), empty_index(apple_id, detail))
+        write_status("empty", detail, source=meta.get("source") or "none")
+        publish_library()
+        return
+    publish_saved(rows, meta, apple_id)
+
+
 def tone_for(delta: float | None, favorable: str, avg: float | None, band: tuple[float, float] | None) -> str:
     if favorable == "band" and avg is not None and band is not None:
         return "good" if band[0] <= avg <= band[1] else "warn"
@@ -1012,7 +1250,13 @@ def trend_sentence(name: str, aggregate_label: str, value_text: str, unit: str, 
     return f"{head}, {abs(rounded)}% {direction} the previous {window}."
 
 
-def build_range(rows: list[dict], range_id: str, label: str, length: int) -> dict:
+def build_range(
+    rows: list[dict],
+    range_id: str,
+    label: str,
+    length: int,
+    levels: dict[tuple[str, str], tuple[str, str]] | None = None,
+) -> dict:
     if length <= 0:
         current = list(rows)
         previous: list[dict] = []
@@ -1037,6 +1281,7 @@ def build_range(rows: list[dict], range_id: str, label: str, length: int) -> dic
             delta = (curr - prev) / abs(prev) * 100.0
         series = []
         series_text = []
+        series_level = []
         numeric = []
         for row in current:
             value = row.get(field)
@@ -1045,9 +1290,15 @@ def build_range(rows: list[dict], range_id: str, label: str, length: int) -> dic
                 series.append(number)
                 series_text.append(fmt_number(number, digits))
                 numeric.append(number)
+                stored = (levels or {}).get((field, row["date"]))
+                if stored and stored[0] == severity_value_key(number):
+                    series_level.append(stored[1])
+                else:
+                    series_level.append(None)
             else:
                 series.append(None)
                 series_text.append("—")
+                series_level.append(None)
         series_max = max(numeric) if numeric else 0
         agg_label = "Latest" if kind == "last" else "Daily average"
         value_text = fmt_number(curr, digits)
@@ -1068,6 +1319,7 @@ def build_range(rows: list[dict], range_id: str, label: str, length: int) -> dic
             "seriesMax": series_max,
             "series": series,
             "seriesText": series_text,
+            "seriesLevel": series_level,
         }
         metrics.append(metric)
         by_id[field] = metric
@@ -1287,14 +1539,19 @@ def set_saved_range(range_id: str, start: str | None, end: str | None) -> None:
         conn.close()
 
 
-def build_custom_range(rows: list[dict], start: str, end: str) -> dict:
+def build_custom_range(
+    rows: list[dict],
+    start: str,
+    end: str,
+    levels: dict[tuple[str, str], tuple[str, str]] | None = None,
+) -> dict:
     current = [row for row in rows if start <= row["date"] <= end]
     span = len(current)
     if span == 0:
-        block = build_range([], "custom", "Custom", 1)
+        block = build_range([], "custom", "Custom", 1, levels)
     else:
         before = [row for row in rows if row["date"] < start]
-        block = build_range(before[-span:] + current, "custom", "Custom", span)
+        block = build_range(before[-span:] + current, "custom", "Custom", span, levels)
     block["start"] = start
     block["end"] = end
     return block
@@ -1302,9 +1559,11 @@ def build_custom_range(rows: list[dict], start: str, end: str) -> dict:
 
 def build_index(rows: list[dict], source: str, source_detail: str, labeled_sample: bool, exported_at: str | None, apple_id: str) -> dict:
     range_id, start, end = active_range()
-    ranges = {item_id: build_range(rows, item_id, label, length) for item_id, label, length in RANGES}
+    uid, _name = current_person()
+    levels = load_severity_map(uid)
+    ranges = {item_id: build_range(rows, item_id, label, length, levels) for item_id, label, length in RANGES}
     if range_id == "custom":
-        ranges["custom"] = build_custom_range(rows, start, end)
+        ranges["custom"] = build_custom_range(rows, start, end, levels)
     return {
         "schema": 1,
         "labeledSample": labeled_sample,
@@ -1314,6 +1573,7 @@ def build_index(rows: list[dict], source: str, source_detail: str, labeled_sampl
         "exportedAt": exported_at,
         "appleId": apple_id,
         "range": {"id": range_id, "start": start, "end": end},
+        "severity": severity_settings(),
         "ranges": ranges,
     }
 
@@ -1652,9 +1912,14 @@ def run(
     add_person: str | None = None,
     select_person: str | None = None,
     list_people: bool = False,
+    delete_person: str | None = None,
     range_id: str | None = None,
     range_start: str | None = None,
     range_end: str | None = None,
+    severity_config: bool = False,
+    save_severity_rows: bool = False,
+    severity_next: bool = False,
+    severity_limit: int = 40,
 ) -> int:
     ensure_layout()
     if record_kind:
@@ -1693,16 +1958,39 @@ def run(
     cfg = read_config()
     apple_id = cfg.get("APPLE_ID", "")
     try:
+        if severity_config or save_severity_rows:
+            raw = sys.stdin.readline()
+            patch = json.loads(raw) if raw.strip() else {}
+            if severity_config:
+                apply_severity_config(patch)
+            else:
+                uid, _name = current_person()
+                if not uid:
+                    raise ValueError("Choose a person before classifying.")
+                save_severity(uid, str(patch.get("field") or ""), list(patch.get("items") or []))
+            republish_current()
+            return 0
+        if severity_next:
+            batch = next_unclassified(severity_limit)
+            print(json.dumps({"ok": True, "done": batch is None, "batch": batch}), flush=True)
+            return 0
         if database:
             set_selected_database(Path(database))
         if add_person:
             add_user(add_person)
+        if delete_person:
+            removed_current = delete_user(delete_person)
+            if removed_current:
+                message = "Choose a person to open this database."
+                write_json(index_path(), empty_index(apple_id, message))
+                write_status("choose", message, source="none")
+                publish_library()
         if select_person:
             set_current_user(select_person)
         if range_id:
             set_saved_range(range_id, range_start, range_end)
-        if (list_people or add_person) and not select_person and not sample and not export and not inbox and not record_kind and not range_id:
-            if list_people and not add_person:
+        if (list_people or add_person or delete_person) and not select_person and not sample and not export and not inbox and not record_kind and not range_id:
+            if list_people and not add_person and not delete_person:
                 publish_users()
             return 0
         if record_kind:
@@ -1777,10 +2065,15 @@ def main() -> None:
     parser.add_argument("--sample-end", help="ISO date the sample series ends on (tests)")
     parser.add_argument("--users", action="store_true", help="write the people in this database")
     parser.add_argument("--add-user", help="add a person to this database")
+    parser.add_argument("--delete-user", help="remove this person and their health data, files, and chat")
     parser.add_argument("--user", help="open the database as this person")
     parser.add_argument("--range", help="save this person's date range: 7d, 30d, 90d, 365d, 3y, 5y, all, or custom")
     parser.add_argument("--range-start", help="custom range start date")
     parser.add_argument("--range-end", help="custom range end date")
+    parser.add_argument("--severity-config", action="store_true", help="save severity colors and switches from a JSON line on stdin")
+    parser.add_argument("--save-severity", action="store_true", help="store classifications from a JSON line on stdin")
+    parser.add_argument("--severity-next", action="store_true", help="print the next unclassified batch as JSON")
+    parser.add_argument("--limit", type=int, default=40, help="how many days --severity-next returns")
     args = parser.parse_args()
     kind = "xray" if args.xray else "blood" if args.blood else "urine" if args.urine else None
     sys.exit(run(
@@ -1796,9 +2089,14 @@ def main() -> None:
         args.add_user,
         args.user,
         args.users,
+        args.delete_user,
         args.range,
         args.range_start,
         args.range_end,
+        args.severity_config,
+        args.save_severity,
+        args.severity_next,
+        args.limit,
     ))
 
 

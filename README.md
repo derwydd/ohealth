@@ -28,7 +28,7 @@ The same command with `--sample` loads invented numbers. The window says they ar
 ## How health data gets here
 
 1. On the iPhone, open Health, tap your picture, and choose **Export All Health Data**. That produces `export.zip`.
-2. Choose it with **File → Import from Apple HealthKit Export**. That reads the file once and stores new records in `~/.config/ohealth/ohealth.sqlite`. Opening the window reads that database. Importing the same file again adds only records that are not already saved.
+2. Choose it with **File → Import → Apple HealthKit Export**. That reads the file once and stores new records in `~/.config/ohealth/ohealth.sqlite`. Opening the window reads that database. Importing the same file again adds only records that are not already saved.
 
    Or put `export.zip` in the inbox and run `ohealth-sync --inbox`:
 

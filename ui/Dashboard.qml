@@ -26,6 +26,8 @@ Item {
   property var blood: []
   property var urine: []
   property string focusId: ""
+  property var severityColors: ({})
+  property bool classifying: false
 
   signal rangeChosen(int index)
   signal customRangeChosen(string start, string end)
@@ -391,7 +393,7 @@ Item {
           width: parent.width
           elide: Text.ElideRight
           visible: root.rangeSpan().length > 0
-          text: root.rangeSpan()
+          text: root.rangeSpan() + (root.classifying ? "  ·  classifying…" : "")
           color: theme.accent
           font.family: theme.fontFamily
           font.pixelSize: theme.fontSize - 1
@@ -440,11 +442,22 @@ Item {
           id: chartCanvas
           anchors.fill: parent
           property var plotted: root.series
+          property var levels: (root.metric && root.metric.seriesLevel) ? root.metric.seriesLevel : []
+          property string levelKey: {
+            var rows = (root.metric && root.metric.seriesLevel) ? root.metric.seriesLevel : []
+            var parts = []
+            for (var n = 0; n < rows.length; n++) parts.push(rows[n] || "")
+            return parts.join("\n")
+          }
+          property var barColors: root.severityColors
           property int focusDay: root.dayIndex
           property int dragLo: root.dragAnchor
           property int dragHi: root.dragEnd
           property real peak: root.metric && root.metric.seriesMax ? root.metric.seriesMax : 0
           onPlottedChanged: requestPaint()
+          onLevelsChanged: requestPaint()
+          onLevelKeyChanged: requestPaint()
+          onBarColorsChanged: requestPaint()
           onFocusDayChanged: requestPaint()
           onDragLoChanged: requestPaint()
           onDragHiChanged: requestPaint()
@@ -471,12 +484,18 @@ Item {
               ctx.fillStyle = theme.selection
               ctx.fillRect(focusDay * slot, 0, Math.max(slot, 1), height)
             }
+            var colors = barColors || {}
             for (var i = 0; i < n; i++) {
               var value = series[i]
               if (value === null || value === undefined || maxV <= 0) continue
               var h = Math.max(1, (Number(value) / maxV) * (height - 4))
-              var marked = dragging ? (i === lo || i === hi) : i === focusDay
-              ctx.fillStyle = marked ? theme.accent : theme.muted
+              var level = levelKey.length ? levelKey.split("\n")[i] : ""
+              var paint = theme.muted
+              if (level === "severe" && colors.severe) paint = colors.severe
+              else if (level === "alert" && colors.alert) paint = colors.alert
+              else if (level === "mild" && colors.mild) paint = colors.mild
+              else if (level === "normal" && colors.normal) paint = colors.normal
+              ctx.fillStyle = paint
               ctx.fillRect(i * slot + Math.max(0, (slot - barW) / 2), height - h, barW, h)
             }
           }
@@ -529,6 +548,37 @@ Item {
         anchors.bottom: parent.bottom
         anchors.margins: 14
         spacing: 6
+
+        Row {
+          visible: root.state === "ready" && root.days.length > 0 && root.metric && root.metric.seriesLevel
+          spacing: 14
+          Repeater {
+            model: [
+              { key: "normal", label: "In range" },
+              { key: "mild", label: "Mild" },
+              { key: "alert", label: "Alert" },
+              { key: "severe", label: "Severe" }
+            ]
+            delegate: Row {
+              required property var modelData
+              spacing: 6
+              Rectangle {
+                width: 10
+                height: 10
+                radius: 2
+                anchors.verticalCenter: parent.verticalCenter
+                color: (root.severityColors && root.severityColors[modelData.key]) ? root.severityColors[modelData.key] : theme.muted
+              }
+              Text {
+                text: modelData.label
+                color: theme.darkForeground
+                font.family: theme.fontFamily
+                font.pixelSize: theme.fontSize - 2
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+          }
+        }
 
         Row {
           visible: root.state === "ready" && root.days.length > 0

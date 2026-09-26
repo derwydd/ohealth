@@ -37,7 +37,7 @@ Item {
       ["enter in the picker", "save that agent as the Omarchy default"],
       ["o in the picker", "open Omarchy's own agent menu, when the shell is installed"],
       ["r", "reload the saved health data"],
-      ["file menu", "Settings, keyboard, switch person, import health data, X-rays, or lab tests"],
+      ["file menu", "Settings, keyboard, switch person, Import, or close"],
       ["opening the app", "choose a person. Import asks you to confirm that person"],
       ["ctrl+p", "preview invented sample data"],
       ["?", "open this window"],

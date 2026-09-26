@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -392,6 +393,226 @@ def cmd_chat(dry_run: bool) -> None:
     })
 
 
+LEVEL_ALIASES = {
+    "red": "severe",
+    "orange": "alert",
+    "yellow": "mild",
+    "green": "normal",
+    "ok": "normal",
+    "in range": "normal",
+    "in_range": "normal",
+    "inside": "normal",
+}
+
+
+def build_classify_prompt(metric: str, unit: str, points: list[dict], sample: bool) -> str:
+    lines = [
+        "Classify each daily health measurement for an adult.",
+        "This is not a diagnosis and not medical advice.",
+        "Reply with JSON only: an array of objects {\"date\",\"level\"}.",
+        "level must be one of: severe, alert, mild, normal.",
+        "severe: far outside the usual range, or a reading that would be treated as urgent.",
+        "alert: outside the usual range enough to notice.",
+        "mild: slightly outside the usual range.",
+        "normal: inside the usual range.",
+        "Use only these dates and values. Do not add dates.",
+    ]
+    if sample:
+        lines.append("These figures are invented sample data, not a person's record. Classify them anyway.")
+    lines.append("")
+    lines.append(f"Metric: {metric} ({unit or 'count'})")
+    lines.append("date value")
+    for point in points:
+        lines.append(f"{point.get('date')} {point.get('value')}")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _level_items(data) -> list:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("result", "output", "text", "response", "structured_output"):
+            if key in data:
+                inner = data[key]
+                if isinstance(inner, str):
+                    try:
+                        inner = json.loads(inner)
+                    except json.JSONDecodeError:
+                        match = re.search(r"\[[\s\S]*\]", inner)
+                        if not match:
+                            continue
+                        try:
+                            inner = json.loads(match.group(0))
+                        except json.JSONDecodeError:
+                            continue
+                if isinstance(inner, list):
+                    return inner
+                if isinstance(inner, dict):
+                    return _level_items(inner)
+    return []
+
+
+def parse_levels(text: str) -> dict[str, str]:
+    from ohealth_sync import SEVERITY_LEVELS
+
+    raw = text or ""
+    data = None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\[[\s\S]*\]", raw)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                data = None
+    items = _level_items(data)
+    found: dict[str, str] = {}
+    allowed = set(SEVERITY_LEVELS)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        day = str(item.get("date") or "").strip()
+        level = str(item.get("level") or "").strip().lower()
+        level = LEVEL_ALIASES.get(level, level)
+        if day and level in allowed:
+            found[day] = level
+    return found
+
+
+def classify_argv(agent_id: str, prompt_path: Path, prompt: str) -> list[str]:
+    """One answer, no tool run. Grok otherwise keeps searching and the bars stay gray."""
+    if agent_id == "grok":
+        schema = json.dumps({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string"},
+                    "level": {"type": "string", "enum": ["severe", "alert", "mild", "normal"]},
+                },
+                "required": ["date", "level"],
+            },
+        })
+        return [
+            "grok",
+            "--prompt-file",
+            str(prompt_path),
+            "--permission-mode",
+            "dontAsk",
+            "--max-turns",
+            "1",
+            "--no-subagents",
+            "--disable-web-search",
+            "--json-schema",
+            schema,
+        ]
+    return reply_argv(agent_id, prompt_path, prompt)
+
+
+def _missing_points(user_id: str, field: str, points: list[dict]) -> list[dict]:
+    from ohealth_sync import load_severity_map, severity_value_key
+
+    stored = load_severity_map(user_id)
+    missing = []
+    for point in points:
+        day = str(point.get("date") or "").strip()
+        try:
+            key = severity_value_key(float(point["value"]))
+        except (TypeError, ValueError):
+            continue
+        previous = stored.get((field, day))
+        if previous and previous[0] == key:
+            continue
+        missing.append({"date": day, "value": float(point["value"])})
+    return missing
+
+
+def cmd_classify(dry_run: bool, pending: bool, limit: int) -> None:
+    from ohealth_paths import home
+    from ohealth_sync import current_person, next_unclassified, republish_current, save_severity
+
+    uid, _name = current_person()
+    if not uid:
+        fail("Choose a person in OHealth before classifying.")
+    sample = False
+    if pending:
+        batch = next_unclassified(limit)
+        if not batch:
+            emit({"ok": True, "done": True, "saved": 0})
+            return
+        field = batch["field"]
+        metric = batch["metric"]
+        unit = batch["unit"]
+        points = batch["points"]
+    else:
+        payload = read_payload("classification")
+        field = str(payload.get("field") or "").strip()
+        metric = str(payload.get("metric") or field)
+        unit = str(payload.get("unit") or "count")
+        sample = bool(payload.get("sample"))
+        points = _missing_points(uid, field, list(payload.get("points") or []))
+        if not points:
+            emit({"ok": True, "done": True, "saved": 0, "cached": True})
+            return
+    prompt = build_classify_prompt(metric, unit, points, sample)
+    selected = read_selected()
+    if dry_run:
+        emit({
+            "ok": True,
+            "dryRun": True,
+            "done": False,
+            "agent": selected,
+            "field": field,
+            "points": points,
+            "prompt": prompt,
+        })
+        return
+    if not selected:
+        fail("No Omarchy agent is chosen. Pick one in OHealth, or run omarchy-default-agent.")
+    prompt_path = cache_dir() / "classify-prompt.txt"
+    cache_dir().mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(prompt, encoding="utf-8")
+    os.chmod(prompt_path, 0o600)
+    argv = classify_argv(selected, prompt_path, prompt)
+    binary = argv[0]
+    if not command_exists(binary):
+        fail(f"{selected} is not installed. The choice is saved in {agent_file()}.")
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(home()),
+    )
+
+    def _stop(_signum, _frame) -> None:
+        if proc.poll() is None:
+            proc.kill()
+        raise SystemExit(1)
+
+    signal.signal(signal.SIGTERM, _stop)
+    try:
+        stdout, stderr = proc.communicate(timeout=40)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        fail("The agent took too long to classify.")
+    reply = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", (stdout or stderr or "")).strip()
+    parsed = parse_levels(reply)
+    items = []
+    for point in points:
+        level = parsed.get(point["date"])
+        if level:
+            items.append({"date": point["date"], "value": point["value"], "level": level})
+    if not items:
+        fail("The agent did not return severity levels.")
+    saved = save_severity(uid, field, items)
+    republish_current()
+    emit({"ok": True, "done": False, "saved": saved, "field": field})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="OHealth Omarchy agent picker")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -403,6 +624,10 @@ def main() -> None:
     ask.add_argument("--dry-run", action="store_true")
     chat = sub.add_parser("chat")
     chat.add_argument("--dry-run", action="store_true")
+    classify = sub.add_parser("classify")
+    classify.add_argument("--dry-run", action="store_true")
+    classify.add_argument("--pending", action="store_true", help="classify the next stored days that have no level yet")
+    classify.add_argument("--limit", type=int, default=40)
     args = parser.parse_args()
     if args.cmd == "list":
         emit(list_payload())
@@ -412,6 +637,8 @@ def main() -> None:
         cmd_set(args.agent_id)
     elif args.cmd == "chat":
         cmd_chat(args.dry_run)
+    elif args.cmd == "classify":
+        cmd_classify(args.dry_run, args.pending, args.limit)
     else:
         cmd_ask(args.dry_run)
 

@@ -530,6 +530,154 @@ def test_existing_rows_become_a_person(tmp: Path) -> None:
     assert steps["series"] == [17]
 
 
+def test_delete_person_removes_their_data(tmp: Path) -> None:
+    env = isolate(tmp)
+    import sqlite3
+    alex = enter_person(env, "Alex")
+    image = tmp / "chest.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nnot-really")
+    alex_xml = tmp / "alex.xml"
+    alex_xml.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" startDate="2026-09-24 08:00:00 -0500" endDate="2026-09-24 09:00:00 -0500" value="11"/>
+</HealthData>
+"""
+    )
+    assert run(env, "ohealth_sync.py", ["--export", str(alex_xml)]).returncode == 0
+    saved = run(env, "ohealth_sync.py", ["--xray", "--file", str(image)])
+    assert saved.returncode == 0, saved.stderr
+    xray_path = Path(json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "files.json").read_text())["xrays"][0]["path"])
+    assert xray_path.is_file()
+    blake = enter_person(env, "Blake")
+    removed = run(env, "ohealth_sync.py", ["--delete-user", alex])
+    assert removed.returncode == 0, removed.stderr
+    assert not xray_path.exists()
+    assert not xray_path.parent.exists()
+    people = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "users.json").read_text())
+    assert [item["name"] for item in people["users"]] == ["Blake"]
+    assert people["current"] == blake
+    database = Path(env["XDG_CONFIG_HOME"]) / "ohealth" / "ohealth.sqlite"
+    conn = sqlite3.connect(database)
+    assert conn.execute("SELECT COUNT(*) FROM days WHERE user_id = ?", (alex,)).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM samples WHERE user_id = ?", (alex,)).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM files WHERE user_id = ?", (alex,)).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM user_meta WHERE user_id = ?", (alex,)).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM users WHERE id = ?", (blake,)).fetchone()[0] == 1
+    conn.close()
+    gone = run(env, "ohealth_sync.py", ["--delete-user", blake])
+    assert gone.returncode == 0, gone.stderr
+    people = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "users.json").read_text())
+    assert people["users"] == []
+    assert people["current"] == ""
+    status = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "status.json").read_text())
+    assert status["state"] == "choose"
+    missing = run(env, "ohealth_sync.py", ["--delete-user", alex])
+    assert missing.returncode == 1
+    assert "not in this database" in missing.stderr
+
+
+def test_severity_is_remembered_for_the_same_reading(tmp: Path) -> None:
+    env = isolate(tmp)
+    enter_person(env, "Alex")
+    xml = tmp / "steps.xml"
+    xml.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <Record type="HKQuantityTypeIdentifierStepCount" unit="count" startDate="2026-09-24 08:00:00 -0500" endDate="2026-09-24 09:00:00 -0500" value="11"/>
+</HealthData>
+"""
+    )
+    assert run(env, "ohealth_sync.py", ["--export", str(xml)]).returncode == 0
+    saved = run(
+        env,
+        "ohealth_sync.py",
+        ["--save-severity"],
+        stdin=json.dumps({
+            "field": "steps",
+            "items": [{"date": "2026-09-24", "value": 11, "level": "severe"}],
+        }) + "\n",
+    )
+    assert saved.returncode == 0, saved.stderr
+    index = load_index(env)
+    assert index["severity"]["auto"] is True
+    assert index["severity"]["classifyAll"] is False
+    assert index["severity"]["colors"]["normal"] == "#9ece6a"
+    window = index["ranges"]["7d"]
+    steps = next(item for item in window["metrics"] if item["id"] == "steps")
+    assert steps["seriesLevel"][window["days"].index("2026-09-24")] == "severe"
+    stale = run(
+        env,
+        "ohealth_sync.py",
+        ["--save-severity"],
+        stdin=json.dumps({
+            "field": "steps",
+            "items": [{"date": "2026-09-24", "value": 99, "level": "normal"}],
+        }) + "\n",
+    )
+    assert stale.returncode == 0, stale.stderr
+    index = load_index(env)
+    window = index["ranges"]["7d"]
+    steps = next(item for item in window["metrics"] if item["id"] == "steps")
+    assert steps["seriesLevel"][window["days"].index("2026-09-24")] is None
+    restored = run(
+        env,
+        "ohealth_sync.py",
+        ["--save-severity"],
+        stdin=json.dumps({
+            "field": "steps",
+            "items": [{"date": "2026-09-24", "value": 11, "level": "alert"}],
+        }) + "\n",
+    )
+    assert restored.returncode == 0, restored.stderr
+    nxt = run(env, "ohealth_sync.py", ["--severity-next", "--limit", "40"])
+    assert nxt.returncode == 0, nxt.stderr
+    assert json.loads(nxt.stdout)["done"] is True
+    cached = run(
+        env,
+        "ohealth_agent.py",
+        ["classify", "--dry-run"],
+        stdin=json.dumps({
+            "field": "steps",
+            "metric": "Steps",
+            "unit": "count",
+            "points": [{"date": "2026-09-24", "value": 11}],
+        }) + "\n",
+    )
+    assert cached.returncode == 0, cached.stderr
+    assert json.loads(cached.stdout)["cached"] is True
+    fresh = run(
+        env,
+        "ohealth_agent.py",
+        ["classify", "--dry-run"],
+        stdin=json.dumps({
+            "field": "steps",
+            "metric": "Steps",
+            "unit": "count",
+            "points": [{"date": "2026-09-24", "value": 50}],
+        }) + "\n",
+    )
+    assert fresh.returncode == 0, fresh.stderr
+    body = json.loads(fresh.stdout)
+    assert body["dryRun"] is True
+    assert "severe" in body["prompt"] and "normal" in body["prompt"]
+    assert body["points"] == [{"date": "2026-09-24", "value": 50}]
+    colors = run(
+        env,
+        "ohealth_sync.py",
+        ["--severity-config"],
+        stdin=json.dumps({"auto": False, "classifyAll": True, "severe": "#112233"}) + "\n",
+    )
+    assert colors.returncode == 0, colors.stderr
+    index = load_index(env)
+    assert index["severity"]["auto"] is False
+    assert index["severity"]["classifyAll"] is True
+    assert index["severity"]["colors"]["severe"] == "#112233"
+    assert index["severity"]["colors"]["alert"] == "#ff9e64"
+    bad = run(env, "ohealth_sync.py", ["--severity-config"], stdin=json.dumps({"severe": "red"}) + "\n")
+    assert bad.returncode == 1
+
+
 def test_import_requires_a_person(tmp: Path) -> None:
     env = isolate(tmp)
     xml = tmp / "export.xml"
@@ -653,6 +801,8 @@ def main() -> None:
         test_database_selection_is_stored,
         test_xrays_and_labs_are_in_the_database_for_the_agent,
         test_people_keep_separate_records,
+        test_delete_person_removes_their_data,
+        test_severity_is_remembered_for_the_same_reading,
         test_existing_rows_become_a_person,
         test_import_requires_a_person,
         test_custom_range_is_saved_for_the_person,
