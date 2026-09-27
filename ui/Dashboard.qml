@@ -36,6 +36,7 @@ Item {
   signal zoneChosen(string name)
   signal sectionChosen(string name)
   signal documentChosen(string id, string kind)
+  signal fileDeleteChosen(string id, string name)
   signal galleryClosed()
 
   readonly property var metrics: (view && view.metrics) ? view.metrics : []
@@ -67,6 +68,34 @@ Item {
     if (n === 0 || width <= 0) return -1
     var index = Math.floor(x / (width / n))
     return Math.max(0, Math.min(n - 1, index))
+  }
+
+  function formatAxis(value) {
+    var n = Number(value)
+    if (!isFinite(n)) return ""
+    var negative = n < 0
+    n = Math.abs(n)
+    var text = (n >= 100 || Math.abs(n - Math.round(n)) < 0.05) ? String(Math.round(n)) : n.toFixed(1)
+    var parts = text.split(".")
+    parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",")
+    return (negative ? "−" : "") + parts.join(".")
+  }
+
+  function axisScale(maxV) {
+    var max = Number(maxV)
+    if (!(max > 0)) return { ceiling: 1, ticks: [0] }
+    var rough = max / 4
+    var mag = Math.pow(10, Math.floor(Math.log10(rough)))
+    if (!isFinite(mag) || mag <= 0) mag = 1
+    var residual = rough / mag
+    var nice = residual <= 1 ? 1 : residual <= 2 ? 2 : residual <= 5 ? 5 : 10
+    var step = nice * mag
+    var ceiling = Math.ceil((max / step) - 1e-9) * step
+    if (!(ceiling >= max)) ceiling += step
+    var ticks = []
+    for (var v = 0, guard = 0; v <= ceiling + step * 0.001 && guard < 8; v += step, guard++)
+      ticks.push(Math.round(v * 1000) / 1000)
+    return { ceiling: ticks.length ? ticks[ticks.length - 1] : ceiling, ticks: ticks }
   }
 
   onViewChanged: {
@@ -367,6 +396,7 @@ Item {
         files: root.gallery === "xrays" ? root.xrays : root.blood.concat(root.urine)
         focusId: root.focusId
         onFocusChosen: (id, kind) => root.documentChosen(id, kind)
+        onDeleteChosen: (id, name) => root.fileDeleteChosen(id, name)
         onCloseRequested: root.galleryClosed()
       }
 
@@ -437,10 +467,75 @@ Item {
         anchors.rightMargin: 14
         anchors.topMargin: 8
         visible: root.gallery === "" && root.state === "ready" && root.series.length > 0
+        readonly property string axisUnit: {
+          if (!root.metric) return ""
+          if (root.metric.unit) return root.metric.unit
+          return root.metric.id === "steps" ? "steps" : ""
+        }
+        readonly property var yScale: root.axisScale(root.metric && root.metric.seriesMax ? root.metric.seriesMax : 0)
+        readonly property real yCeiling: yScale.ceiling
+        readonly property var yTicks: yScale.ticks
+        readonly property string tickKey: {
+          var ticks = yTicks
+          var parts = []
+          for (var i = 0; i < ticks.length; i++) parts.push(ticks[i])
+          return parts.join(",")
+        }
+        readonly property real axisInset: Math.max(8, theme.fontSize * 0.55)
+
+        Text {
+          id: axisSizer
+          visible: false
+          font.family: theme.fontFamily
+          font.pixelSize: theme.fontSize - 2
+          text: {
+            var widest = ""
+            var ticks = chartBox.yTicks
+            for (var i = 0; i < ticks.length; i++) {
+              var label = root.formatAxis(ticks[i])
+              if (i === ticks.length - 1 && chartBox.axisUnit) label += " " + chartBox.axisUnit
+              if (label.length > widest.length) widest = label
+            }
+            return widest
+          }
+        }
+
+        Item {
+          id: yAxis
+          anchors.left: parent.left
+          anchors.top: parent.top
+          anchors.bottom: parent.bottom
+          width: Math.max(44, axisSizer.implicitWidth + 8)
+
+          Repeater {
+            model: chartBox.yTicks
+            delegate: Text {
+              required property var modelData
+              required property int index
+              width: yAxis.width
+              horizontalAlignment: Text.AlignRight
+              text: root.formatAxis(modelData) + (index === chartBox.yTicks.length - 1 && chartBox.axisUnit ? " " + chartBox.axisUnit : "")
+              color: theme.darkForeground
+              font.family: theme.fontFamily
+              font.pixelSize: theme.fontSize - 2
+              y: {
+                var ceiling = chartBox.yCeiling
+                var inset = chartBox.axisInset
+                var span = Math.max(1, yAxis.height - inset * 2)
+                var grid = (yAxis.height - inset) - (ceiling > 0 ? (Number(modelData) / ceiling) * span : 0)
+                return grid - height / 2
+              }
+            }
+          }
+        }
 
         Canvas {
           id: chartCanvas
-          anchors.fill: parent
+          anchors.left: yAxis.right
+          anchors.leftMargin: 8
+          anchors.top: parent.top
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
           property var plotted: root.series
           property var levels: (root.metric && root.metric.seriesLevel) ? root.metric.seriesLevel : []
           property string levelKey: {
@@ -453,7 +548,9 @@ Item {
           property int focusDay: root.dayIndex
           property int dragLo: root.dragAnchor
           property int dragHi: root.dragEnd
-          property real peak: root.metric && root.metric.seriesMax ? root.metric.seriesMax : 0
+          property real ceiling: chartBox.yCeiling
+          property string tickKey: chartBox.tickKey
+          property real axisInset: chartBox.axisInset
           onPlottedChanged: requestPaint()
           onLevelsChanged: requestPaint()
           onLevelKeyChanged: requestPaint()
@@ -461,7 +558,9 @@ Item {
           onFocusDayChanged: requestPaint()
           onDragLoChanged: requestPaint()
           onDragHiChanged: requestPaint()
-          onPeakChanged: requestPaint()
+          onCeilingChanged: requestPaint()
+          onTickKeyChanged: requestPaint()
+          onAxisInsetChanged: requestPaint()
           onWidthChanged: requestPaint()
           onHeightChanged: requestPaint()
           onPaint: {
@@ -472,7 +571,10 @@ Item {
             if (n === 0 || width <= 0 || height <= 0) return
             var slot = width / n
             var barW = Math.max(1, slot > 2 ? slot - 1 : slot)
-            var maxV = peak
+            var maxV = ceiling
+            var inset = axisInset
+            var span = Math.max(1, height - inset * 2)
+            var base = height - inset
             var lo = dragLo
             var hi = dragHi
             if (lo > hi) { var swap = lo; lo = hi; hi = swap }
@@ -484,11 +586,27 @@ Item {
               ctx.fillStyle = theme.selection
               ctx.fillRect(focusDay * slot, 0, Math.max(slot, 1), height)
             }
+            var ticks = tickKey.length ? tickKey.split(",") : []
+            ctx.strokeStyle = theme.lighterBackground
+            ctx.lineWidth = 1
+            for (var t = 0; t < ticks.length; t++) {
+              var tick = Number(ticks[t])
+              var gy = base - (maxV > 0 ? (tick / maxV) * span : 0)
+              ctx.beginPath()
+              ctx.moveTo(0, gy)
+              ctx.lineTo(width, gy)
+              ctx.stroke()
+            }
+            ctx.strokeStyle = theme.muted
+            ctx.beginPath()
+            ctx.moveTo(0.5, inset)
+            ctx.lineTo(0.5, base)
+            ctx.stroke()
             var colors = barColors || {}
             for (var i = 0; i < n; i++) {
               var value = series[i]
               if (value === null || value === undefined || maxV <= 0) continue
-              var h = Math.max(1, (Number(value) / maxV) * (height - 4))
+              var h = Math.max(1, (Number(value) / maxV) * span)
               var level = levelKey.length ? levelKey.split("\n")[i] : ""
               var paint = theme.muted
               if (level === "severe" && colors.severe) paint = colors.severe
@@ -496,7 +614,7 @@ Item {
               else if (level === "mild" && colors.mild) paint = colors.mild
               else if (level === "normal" && colors.normal) paint = colors.normal
               ctx.fillStyle = paint
-              ctx.fillRect(i * slot + Math.max(0, (slot - barW) / 2), height - h, barW, h)
+              ctx.fillRect(i * slot + Math.max(0, (slot - barW) / 2), base - h, barW, h)
             }
           }
           MouseArea {

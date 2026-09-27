@@ -11,6 +11,7 @@ Item {
   property string focusId: ""
 
   signal focusChosen(string id, string kind)
+  signal deleteChosen(string id, string name)
   signal closeRequested()
 
   function fileUrl(path) {
@@ -90,6 +91,7 @@ Item {
           Repeater {
             model: root.files
             delegate: Rectangle {
+              id: card
               required property var modelData
               width: 200
               height: 250
@@ -97,6 +99,7 @@ Item {
               color: theme.darkBackground
               border.width: root.focusId === modelData.id ? 2 : 1
               border.color: root.focusId === modelData.id ? theme.accent : theme.lighterBackground
+              HoverHandler { id: cardHover }
 
               Image {
                 anchors.top: parent.top
@@ -156,6 +159,37 @@ Item {
                 onClicked: {
                   var next = root.focusId === modelData.id ? "" : modelData.id
                   root.focusChosen(next, modelData.kind || "")
+                }
+              }
+
+              Rectangle {
+                id: removeFile
+                z: 2
+                visible: cardHover.hovered
+                anchors.left: parent.left
+                anchors.leftMargin: 14
+                anchors.top: parent.top
+                anchors.topMargin: 168
+                width: 24
+                height: 24
+                radius: 4
+                color: removeFileArea.containsMouse ? theme.selection : theme.darkerBackground
+                border.width: 1
+                border.color: theme.lighterBackground
+                Text {
+                  anchors.centerIn: parent
+                  text: "−"
+                  color: theme.red
+                  font.family: theme.fontFamily
+                  font.pixelSize: theme.fontSize + 4
+                  font.bold: true
+                }
+                MouseArea {
+                  id: removeFileArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.deleteChosen(modelData.id, modelData.name || "this file")
                 }
               }
             }

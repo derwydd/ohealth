@@ -20,6 +20,8 @@ ShellRoot {
     refreshAgents()
     if (sampleRequested) root.sampleOnNextEnter = true
     refreshPeople()
+    companionBoot.command = [companionScript, "status"]
+    companionBoot.running = true
   }
 
   readonly property bool sampleRequested: Quickshell.env("OHEALTH_SAMPLE") === "1"
@@ -30,6 +32,7 @@ ShellRoot {
   readonly property string binDir: Quickshell.shellDir + "/../bin"
   readonly property string syncScript: binDir + "/ohealth-sync"
   readonly property string agentScript: binDir + "/ohealth-agent"
+  readonly property string companionScript: binDir + "/ohealth-companion"
   readonly property string defaultDatabase: configHome + "/ohealth/ohealth.sqlite"
   readonly property string databasePath: (status && status.database) ? status.database : defaultDatabase
   readonly property var rangeIds: ["7d", "30d", "90d", "365d", "3y", "5y", "all"]
@@ -67,6 +70,8 @@ ShellRoot {
   property string pendingImport: ""
   property string pendingDelete: ""
   property string pendingDeleteName: ""
+  property string pendingFile: ""
+  property string pendingFileName: ""
   property string colorRaw: ""
   property string themeShellRaw: ""
   property string machineShellRaw: ""
@@ -345,6 +350,23 @@ ShellRoot {
     usersProc.running = true
   }
 
+  function askDeleteFile(id, name) {
+    if (!id || fileDeleteProc.running || pendingFile) return
+    pendingFile = id
+    pendingFileName = String(name || "this file")
+    keys.forceActiveFocus()
+  }
+
+  function confirmDeleteFile() {
+    var id = pendingFile
+    pendingFile = ""
+    pendingFileName = ""
+    if (!id || fileDeleteProc.running) return
+    if (chatFocusId === id) chatFocusId = ""
+    fileDeleteProc.command = [syncScript, "--delete-file", id]
+    fileDeleteProc.running = true
+  }
+
   function enterPerson(id) {
     if (!id || personProc.running) return
     var args = [syncScript, "--user", id]
@@ -500,6 +522,20 @@ ShellRoot {
     : ({ severe: "#f7768e", alert: "#ff9e64", mild: "#e0af68", normal: "#9ece6a" })
   readonly property bool classifyAuto: !(index && index.severity) || index.severity.auto !== false
   readonly property bool classifyAll: !!(index && index.severity && index.severity.classifyAll)
+  property var companion: ({
+    enabled: false,
+    paired: false,
+    device: "",
+    code: "",
+    fingerprint: "",
+    service: "_ohealth._tcp",
+    name: "OHealth",
+    port: 0,
+    listening: false,
+    error: ""
+  })
+  property bool companionStop: false
+  property bool companionApplyListen: false
   property bool classifyHold: false
   property bool classifyBusy: false
   property bool classifyCancel: false
@@ -581,6 +617,35 @@ ShellRoot {
     severityProc.running = true
   }
 
+  function applyCompanion(raw) {
+    try { companion = JSON.parse(raw) } catch (e) { return }
+    if (!companionApplyListen) return
+    companionApplyListen = false
+    setCompanionListening(!!companion.enabled)
+  }
+
+  function setCompanionListening(on) {
+    if (on) {
+      companionStop = false
+      if (!companionServe.running) {
+        companionServe.command = [companionScript, "serve"]
+        companionServe.running = true
+      }
+      return
+    }
+    if (companionServe.running) {
+      companionStop = true
+      companionServe.running = false
+    }
+  }
+
+  function saveCompanion(patch) {
+    if (companionProc.running) return
+    companionProc.payload = JSON.stringify(patch || {})
+    companionProc.command = [companionScript, "config"]
+    companionProc.running = true
+  }
+
   FileView {
     path: root.stateHome + "/omarchy/current/theme/colors.toml"
     watchChanges: true
@@ -639,6 +704,14 @@ ShellRoot {
         root.chatMessages = parsed.messages || []
       } catch (e) { return }
     }
+    onFileChanged: reload()
+  }
+  FileView {
+    id: companionFile
+    path: root.cacheDir + "/companion.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.applyCompanion(text())
     onFileChanged: reload()
   }
   FileView {
@@ -750,6 +823,39 @@ ShellRoot {
     }
   }
   Process {
+    id: companionBoot
+    running: false
+    onExited: {
+      root.companionApplyListen = true
+      companionFile.reload()
+    }
+  }
+  Process {
+    id: companionProc
+    running: false
+    stdinEnabled: true
+    property string payload: ""
+    stderr: StdioCollector { id: companionErr }
+    onStarted: write(payload + "\n")
+    onExited: (exitCode) => {
+      if (exitCode !== 0) toast.show(String(companionErr.text || "").trim() || "Could not update iPhone sync")
+      root.companionApplyListen = true
+      companionFile.reload()
+    }
+  }
+  Process {
+    id: companionServe
+    running: false
+    stderr: StdioCollector { id: companionServeErr }
+    onExited: (exitCode) => {
+      var stopped = root.companionStop
+      root.companionStop = false
+      companionFile.reload()
+      if (!stopped && exitCode !== 0 && root.companion.enabled)
+        toast.show(String(companionServeErr.text || "").trim() || "iPhone sync stopped")
+    }
+  }
+  Process {
     id: severityProc
     running: false
     stdinEnabled: true
@@ -791,6 +897,15 @@ ShellRoot {
       chatView.reload()
       usersFile.reload()
       keys.forceActiveFocus()
+    }
+  }
+  Process {
+    id: fileDeleteProc
+    running: false
+    stderr: StdioCollector { id: fileDeleteErr }
+    onExited: (exitCode) => {
+      filesView.reload()
+      if (exitCode !== 0) toast.show(String(fileDeleteErr.text || "").trim() || "Could not remove that file")
     }
   }
   Process {
@@ -962,7 +1077,7 @@ ShellRoot {
       MouseArea {
         z: 25
         anchors.fill: parent
-        enabled: root.sessionEntered && !root.agentOpen && !root.fileMenuOpen && !root.settingsOpen && !root.keysOpen && root.pendingImport === "" && !root.exportBusy
+        enabled: root.sessionEntered && !root.agentOpen && !root.fileMenuOpen && !root.settingsOpen && !root.keysOpen && root.pendingImport === "" && root.pendingFile === "" && !root.exportBusy
         propagateComposedEvents: true
         onPressed: function(mouse) {
           mouse.accepted = false
@@ -988,6 +1103,14 @@ ShellRoot {
             root.pendingDelete = ""
             root.pendingDeleteName = ""
           } else if (k === Qt.Key_Return || k === Qt.Key_Enter) root.confirmDelete()
+          event.accepted = true
+          return
+        }
+        if (root.pendingFile) {
+          if (k === Qt.Key_Escape) {
+            root.pendingFile = ""
+            root.pendingFileName = ""
+          } else if (k === Qt.Key_Return || k === Qt.Key_Enter) root.confirmDeleteFile()
           event.accepted = true
           return
         }
@@ -1197,6 +1320,7 @@ ShellRoot {
         }
         onSectionChosen: name => root.gallery = name
         onDocumentChosen: (id, kind) => root.chatFocusId = id
+        onFileDeleteChosen: (id, name) => root.askDeleteFile(id, name)
         onGalleryClosed: root.gallery = ""
       }
 
@@ -1800,6 +1924,102 @@ ShellRoot {
       }
 
       Rectangle {
+        visible: root.pendingFile !== ""
+        z: 90
+        anchors.fill: parent
+        color: Qt.rgba(0, 0, 0, 0.45)
+        MouseArea { anchors.fill: parent }
+
+        Rectangle {
+          z: 1
+          anchors.centerIn: parent
+          width: 460
+          height: fileDeleteCol.implicitHeight + 36
+          radius: 10
+          color: appTheme.darkBackground
+          border.width: 1
+          border.color: appTheme.lighterBackground
+
+          Column {
+            id: fileDeleteCol
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 18
+            spacing: 16
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              text: "Remove " + root.pendingFileName + "?"
+              color: appTheme.brightForeground
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize + 2
+              font.bold: true
+            }
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              text: "This deletes the imported file. Saved health days stay."
+              color: appTheme.foreground
+              font.family: appTheme.fontFamily
+              font.pixelSize: appTheme.fontSize
+            }
+            Row {
+              spacing: 10
+              Rectangle {
+                width: cancelFileLabel.implicitWidth + 28
+                height: 34
+                radius: 6
+                color: cancelFileArea.containsMouse ? appTheme.selection : appTheme.darkerBackground
+                border.width: 1
+                border.color: appTheme.lighterBackground
+                Text {
+                  id: cancelFileLabel
+                  anchors.centerIn: parent
+                  text: "Cancel"
+                  color: appTheme.foreground
+                  font.family: appTheme.fontFamily
+                  font.pixelSize: appTheme.fontSize
+                }
+                MouseArea {
+                  id: cancelFileArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.pendingFile = ""
+                    root.pendingFileName = ""
+                  }
+                }
+              }
+              Rectangle {
+                width: confirmFileLabel.implicitWidth + 28
+                height: 34
+                radius: 6
+                color: confirmFileArea.containsMouse ? Qt.lighter(appTheme.red, 1.12) : appTheme.red
+                Text {
+                  id: confirmFileLabel
+                  anchors.centerIn: parent
+                  text: "Remove"
+                  color: appTheme.darkerBackground
+                  font.family: appTheme.fontFamily
+                  font.pixelSize: appTheme.fontSize
+                  font.bold: true
+                }
+                MouseArea {
+                  id: confirmFileArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.confirmDeleteFile()
+                }
+              }
+            }
+          }
+        }
+      }
+
+      Rectangle {
         visible: root.pendingImport !== ""
         z: 70
         anchors.fill: parent
@@ -1936,7 +2156,7 @@ ShellRoot {
     title: "OHealth Settings"
     parentWindow: win
     implicitWidth: 560
-    implicitHeight: 680
+    implicitHeight: 760
     color: appTheme.background
     onVisibleChanged: if (visible) settingsPanel.forceActiveFocus()
     Settings {
@@ -1947,6 +2167,7 @@ ShellRoot {
       colors: root.severityColors
       classifyAuto: root.classifyAuto
       classifyAll: root.classifyAll
+      companion: root.companion
       onRequestClose: root.closeSettings()
       onRequestChoose: root.chooseDatabase()
       onColorsChosen: (severe, alert, mild, normal) => root.saveSeverity({
@@ -1964,6 +2185,8 @@ ShellRoot {
         classifyAllTimer.interval = 800
         root.saveSeverity({ classifyAll: enabled })
       }
+      onCompanionEnabledChosen: enabled => root.saveCompanion({ enabled: enabled })
+      onCompanionPairChosen: root.saveCompanion({ pair: true })
     }
   }
 

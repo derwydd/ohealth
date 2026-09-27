@@ -1679,6 +1679,147 @@ def add_chat_message(role: str, body: str, agent: str, scope: str) -> None:
     publish_library()
 
 
+def _unlink_owned_file(path: str) -> None:
+    candidate = Path(path)
+    roots = (xray_dir(), document_dir())
+    if any(_path_is_inside(candidate, root) for root in roots) and candidate.is_file():
+        candidate.unlink()
+
+
+def delete_record(record_id: str) -> str:
+    """Remove one imported X-ray or lab file for the current person."""
+    conn = connect_db()
+    path = ""
+    name = ""
+    try:
+        person = require_user(conn)
+        row = conn.execute(
+            "SELECT id, name, path FROM files WHERE id = ? AND user_id = ?",
+            (record_id.strip(), person["id"]),
+        ).fetchone()
+        if row is None:
+            raise ValueError("That file is not in this database.")
+        path = row["path"]
+        name = row["name"]
+        conn.execute("DELETE FROM files WHERE id = ? AND user_id = ?", (row["id"], person["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    _unlink_owned_file(path)
+    publish_library()
+    return name
+
+
+COMPANION_OPS = {
+    "steps": "sum",
+    "activeKcal": "sum",
+    "exerciseMin": "sum",
+    "distanceKm": "sum",
+    "sleepHours": "sleep",
+    "restingHr": "avg",
+    "heartRate": "avg",
+    "hrv": "avg",
+    "spo2": "avg",
+    "respiratory": "avg",
+    "weightKg": "last",
+}
+COMPANION_BATCH = 2000
+
+
+def _companion_sample(sample: dict) -> dict | None:
+    if not isinstance(sample, dict):
+        return None
+    field = str(sample.get("field") or "").strip()
+    op = COMPANION_OPS.get(field)
+    if op is None or str(sample.get("op") or "").strip() != op:
+        return None
+    day = str(sample.get("day") or "").strip()
+    if len(day) != 10 or day[4] != "-" or day[7] != "-":
+        return None
+    try:
+        datetime.fromisoformat(day)
+    except ValueError:
+        return None
+    try:
+        value = float(sample.get("value"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    unit = str(sample.get("unit") or "").strip().lower()
+    if field == "sleepHours" and unit in {"s", "sec", "second", "seconds"}:
+        value = value / 3600.0
+    elif field == "exerciseMin" and unit in {"s", "sec", "second", "seconds"}:
+        value = value / 60.0
+    else:
+        value = convert_quantity(field, value, unit)
+    if not math.isfinite(value):
+        return None
+    at = str(sample.get("at") or "").strip()
+    sid = str(sample.get("id") or "").strip()
+    if not sid or len(sid) > 80:
+        sid = sample_id(op, field, day, at or day, unit or field)
+    return {"id": sid, "day": day, "field": field, "op": op, "value": value, "at": at}
+
+
+def ingest_companion_samples(samples: list) -> dict:
+    """Store samples from the paired iPhone and rebuild the days they touch.
+
+    Invented sample rows are removed the first time a real sample arrives.
+    An Apple export already in the database is kept and merged.
+    """
+    if not isinstance(samples, list):
+        raise ValueError("Samples must be a list.")
+    if len(samples) > COMPANION_BATCH:
+        raise ValueError(f"Send at most {COMPANION_BATCH} samples at a time.")
+    cleaned = [item for item in (_companion_sample(sample) for sample in samples) if item]
+    if not cleaned:
+        return {"saved": 0, "days": 0}
+    conn = connect_db()
+    touched: set[str] = set()
+    try:
+        person = require_user(conn)
+        uid = person["id"]
+        labeled = conn.execute(
+            "SELECT value FROM user_meta WHERE user_id = ? AND key = 'labeledSample'",
+            (uid,),
+        ).fetchone()
+        if labeled is not None and labeled["value"] == "1":
+            conn.execute("DELETE FROM days WHERE user_id = ?", (uid,))
+            conn.execute("DELETE FROM samples WHERE user_id = ?", (uid,))
+        for item in cleaned:
+            previous = conn.execute(
+                "SELECT day FROM samples WHERE user_id = ? AND id = ?",
+                (uid, item["id"]),
+            ).fetchone()
+            if previous is not None and previous["day"]:
+                touched.add(previous["day"])
+            touched.add(item["day"])
+            conn.execute(
+                "INSERT INTO samples (user_id, id, day, field, op, value, at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, id) DO UPDATE SET "
+                "day = excluded.day, field = excluded.field, op = excluded.op, "
+                "value = excluded.value, at = excluded.at",
+                (uid, item["id"], item["day"], item["field"], item["op"], item["value"], item["at"]),
+            )
+        for day in touched:
+            refresh_day(conn, uid, day)
+        source = conn.execute(
+            "SELECT value FROM user_meta WHERE user_id = ? AND key = 'source'",
+            (uid,),
+        ).fetchone()
+        meta = {"stored": "1", "labeledSample": "0"}
+        if source is None or source["value"] in {"", "sample", "none"}:
+            meta["source"] = "companion"
+            meta["sourceDetail"] = "Synced from the paired iPhone."
+        save_user_meta(conn, uid, meta)
+        conn.commit()
+    finally:
+        conn.close()
+    republish_current()
+    return {"saved": len(cleaned), "days": len(touched)}
+
+
 def import_record(kind: str, source: Path) -> dict:
     """Copy an X-ray or lab file into the config directory and record its path."""
     if kind not in {"xray", "blood", "urine"}:
@@ -1920,6 +2061,7 @@ def run(
     save_severity_rows: bool = False,
     severity_next: bool = False,
     severity_limit: int = 40,
+    delete_file: str | None = None,
 ) -> int:
     ensure_layout()
     if record_kind:
@@ -1973,6 +2115,9 @@ def run(
         if severity_next:
             batch = next_unclassified(severity_limit)
             print(json.dumps({"ok": True, "done": batch is None, "batch": batch}), flush=True)
+            return 0
+        if delete_file:
+            delete_record(delete_file)
             return 0
         if database:
             set_selected_database(Path(database))
@@ -2066,6 +2211,7 @@ def main() -> None:
     parser.add_argument("--users", action="store_true", help="write the people in this database")
     parser.add_argument("--add-user", help="add a person to this database")
     parser.add_argument("--delete-user", help="remove this person and their health data, files, and chat")
+    parser.add_argument("--delete-file", help="remove this imported X-ray or lab file")
     parser.add_argument("--user", help="open the database as this person")
     parser.add_argument("--range", help="save this person's date range: 7d, 30d, 90d, 365d, 3y, 5y, all, or custom")
     parser.add_argument("--range-start", help="custom range start date")
@@ -2097,6 +2243,7 @@ def main() -> None:
         args.save_severity,
         args.severity_next,
         args.limit,
+        args.delete_file,
     ))
 
 

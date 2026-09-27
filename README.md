@@ -2,7 +2,7 @@
 
 Activity, vitals, and trends in a keyboard-driven window for [Omarchy](https://omarchy.org). The UI is Quickshell QML. It follows the active Omarchy theme and asks Omarchy's chosen system agent about the metric you are looking at.
 
-This is not Apple's Health app, and it does not talk to HealthKit. HealthKit is an on-device framework, and Apple does not publish a HealthKit cloud API. The numbers on screen come from a file you export on an iPhone, or from a labeled sample series when you have no export yet.
+This is not Apple's Health app. HealthKit stays on the iPhone: Apple does not publish a HealthKit cloud API. The numbers on screen come from a file you export, from the paired OHealth iPhone app on the local network, or from a labeled sample series when you have no data yet.
 
 ## Run
 
@@ -35,7 +35,8 @@ The same command with `--sample` loads invented numbers. The window says they ar
    `~/.local/share/ohealth/inbox`
 
    `ohealth-sync --export PATH` saves a file the same way.
-3. Press `r` to reload the saved database.
+3. Or turn on **Settings → Listen for an iPhone**. The computer advertises `_ohealth._tcp` and shows a pairing code. The iPhone app enters that code, checks the certificate, and sends new Health samples. Those samples are saved for the person this window has open. The prompt for writing that iPhone app is `docs/ios-companion-prompt.md`.
+4. Press `r` to reload the saved database.
 
 A directory of [Health Auto Export](https://www.healthexportapp.com) JSON is accepted too. After an import, the sync script publishes `~/.cache/ohealth/index.json` and `status.json` from the database. The window watches both.
 
@@ -96,10 +97,11 @@ bin/ohealth-sync            database, import, or sample → index.json
 bin/ohealth-agent           list, set, ask the Omarchy default
 bin/ohealth_sync.py         Apple Health XML/zip and Health Auto Export JSON
 bin/ohealth_agent.py        ~/.config/omarchy/defaults/agent
+bin/ohealth_companion.py    local-network pairing and iPhone sample ingest
 ui/shell.qml                window, keys, agent, theme watchers
 ui/Theme.qml                colors.toml and shell.toml
 ui/Dashboard.qml            summary, activity, vitals, trend
-ui/Settings.qml             local database path
+ui/Settings.qml             database, severity colors, iPhone sync
 ui/AgentPicker.qml          Omarchy's agent list
 ui/Help.qml                 key map
 systemd/                    optional 30 minute re-index
@@ -115,4 +117,4 @@ The tests use a temporary home. They do not read your iCloud cookies or your Oma
 
 ## What still needs an Apple device
 
-The health records have to be exported on an iPhone (or produced by Health Auto Export) and placed in the inbox. There is no step in this app that fetches HealthKit from iCloud, because that API is not available.
+HealthKit can only be read on the iPhone. This app never fetches it from iCloud. Either export the file and import it here, or run the companion app from `docs/ios-companion-prompt.md` on the same network and pair it from Settings.

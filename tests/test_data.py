@@ -459,6 +459,45 @@ def test_xrays_and_labs_are_in_the_database_for_the_agent(tmp: Path) -> None:
     assert "whole database" in json.loads(whole.stdout)["prompt"]
 
 
+def test_delete_file_removes_that_import(tmp: Path) -> None:
+    env = isolate(tmp)
+    enter_person(env, "Alex")
+    image = tmp / "chest.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nnot-really")
+    blood = tmp / "cbc.pdf"
+    blood.write_text("hemoglobin 14")
+    outside = tmp / "secret.txt"
+    outside.write_text("keep")
+    assert run(env, "ohealth_sync.py", ["--xray", "--file", str(image)]).returncode == 0
+    assert run(env, "ohealth_sync.py", ["--blood", "--file", str(blood)]).returncode == 0
+    listed = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "files.json").read_text())
+    xray = listed["xrays"][0]
+    xray_path = Path(xray["path"])
+    removed = run(env, "ohealth_sync.py", ["--delete-file", xray["id"]])
+    assert removed.returncode == 0, removed.stderr
+    assert not xray_path.exists()
+    listed = json.loads((Path(env["XDG_CACHE_HOME"]) / "ohealth" / "files.json").read_text())
+    assert listed["xrays"] == []
+    assert listed["blood"][0]["name"] == "cbc.pdf"
+    assert Path(listed["blood"][0]["path"]).is_file()
+
+    import sqlite3
+    database = Path(env["XDG_CONFIG_HOME"]) / "ohealth" / "ohealth.sqlite"
+    conn = sqlite3.connect(database)
+    user_id = conn.execute("SELECT value FROM meta WHERE key = 'user'").fetchone()[0]
+    conn.execute(
+        "INSERT INTO files (id, user_id, kind, name, path, added_at) VALUES (?, ?, 'xray', 'secret.txt', ?, '2026-09-26T00:00:00+00:00')",
+        ("poison", user_id, str(outside)),
+    )
+    conn.commit()
+    conn.close()
+    poisoned = run(env, "ohealth_sync.py", ["--delete-file", "poison"])
+    assert poisoned.returncode == 0, poisoned.stderr
+    assert outside.read_text() == "keep"
+    missing = run(env, "ohealth_sync.py", ["--delete-file", "missing"])
+    assert missing.returncode == 1
+
+
 def test_people_keep_separate_records(tmp: Path) -> None:
     env = isolate(tmp)
     alex = enter_person(env, "Alex")
@@ -788,6 +827,82 @@ def test_custom_range_is_saved_for_the_person(tmp: Path) -> None:
     assert load_index(env)["range"]["id"] == "7d"
 
 
+def test_companion_pairs_and_stores_samples(tmp: Path) -> None:
+    env = isolate(tmp)
+    enter_person(env, "Alex")
+    assert run(env, "ohealth_sync.py", ["--sample", "--sample-end", "2026-09-25"]).returncode == 0
+    enabled = run(env, "ohealth_companion.py", ["config"], stdin=json.dumps({"enabled": True}))
+    assert enabled.returncode == 0, enabled.stderr
+    state = json.loads(enabled.stdout)
+    assert state["enabled"] is True
+    assert state["paired"] is False
+    assert len(state["code"]) == 6
+    assert state["fingerprint"]
+    assert "token" not in state
+    status_path = Path(env["XDG_CACHE_HOME"]) / "ohealth" / "companion.json"
+    assert state["code"] in status_path.read_text()
+
+    snippet = r"""
+import json, sys
+from ohealth_companion import handle_message
+code = sys.argv[1]
+bad = handle_message({"type": "pair", "code": "000000", "device": "nope"})
+assert bad["type"] == "error", bad
+good = handle_message({"type": "pair", "code": code, "device": "Alex iPhone"})
+assert good["type"] == "paired", good
+assert len(good["token"]) == 64
+assert good["person"] == "Alex"
+synced = handle_message({
+    "type": "sync",
+    "token": good["token"],
+    "samples": [
+        {"id": "step-1", "day": "2026-09-24", "field": "steps", "op": "sum", "value": 42, "at": "2026-09-24T15:00:00Z", "unit": "count"},
+        {"id": "mood-1", "day": "2026-09-24", "field": "mood", "op": "sum", "value": 1},
+    ],
+})
+assert synced == {"type": "synced", "saved": 1, "days": 1}, synced
+denied = handle_message({"type": "sync", "token": "nope", "samples": []})
+assert denied["type"] == "error", denied
+json.dump({"token": good["token"]}, sys.stdout)
+"""
+    paired = subprocess.run(
+        [PYTHON, "-c", snippet, state["code"]],
+        text=True,
+        capture_output=True,
+        env={**env, "PYTHONPATH": str(BIN)},
+        check=False,
+    )
+    assert paired.returncode == 0, paired.stderr
+    token = json.loads(paired.stdout)["token"]
+    assert token not in status_path.read_text()
+    index = load_index(env)
+    assert index["labeledSample"] is False
+    assert index["source"] == "companion"
+    steps = next(item for item in index["ranges"]["7d"]["metrics"] if item["id"] == "steps")
+    assert steps["series"] == [42]
+
+    again = run(env, "ohealth_companion.py", ["config"], stdin=json.dumps({"enabled": False}))
+    assert again.returncode == 0, again.stderr
+    assert json.loads(again.stdout)["enabled"] is False
+    restored = run(env, "ohealth_companion.py", ["config"], stdin=json.dumps({"enabled": True}))
+    assert restored.returncode == 0, restored.stderr
+    assert json.loads(restored.stdout)["paired"] is True
+    rotated = run(env, "ohealth_companion.py", ["config"], stdin=json.dumps({"pair": True}))
+    assert rotated.returncode == 0, rotated.stderr
+    rotated_state = json.loads(rotated.stdout)
+    assert rotated_state["paired"] is False
+    assert rotated_state["code"] != state["code"]
+    stale = subprocess.run(
+        [PYTHON, "-c", "import json,sys\nfrom ohealth_companion import handle_message\nprint(json.dumps(handle_message({'type':'sync','token':sys.argv[1],'samples':[]})))", token],
+        text=True,
+        capture_output=True,
+        env={**env, "PYTHONPATH": str(BIN)},
+        check=False,
+    )
+    assert stale.returncode == 0, stale.stderr
+    assert json.loads(stale.stdout)["type"] == "error"
+
+
 def main() -> None:
     import tempfile
     tests = [
@@ -800,12 +915,14 @@ def main() -> None:
         test_reimport_adds_new_records_without_duplicating,
         test_database_selection_is_stored,
         test_xrays_and_labs_are_in_the_database_for_the_agent,
+        test_delete_file_removes_that_import,
         test_people_keep_separate_records,
         test_delete_person_removes_their_data,
         test_severity_is_remembered_for_the_same_reading,
         test_existing_rows_become_a_person,
         test_import_requires_a_person,
         test_custom_range_is_saved_for_the_person,
+        test_companion_pairs_and_stores_samples,
         test_missing_export_is_an_error,
         test_agent_picker_writes_omarchy_file,
     ]

@@ -9,6 +9,7 @@ Item {
   property var colors: ({ severe: "#f7768e", alert: "#ff9e64", mild: "#e0af68", normal: "#9ece6a" })
   property bool classifyAuto: true
   property bool classifyAll: false
+  property var companion: ({})
   property string picking: ""
 
   signal requestClose()
@@ -16,6 +17,8 @@ Item {
   signal colorsChosen(string severe, string alert, string mild, string normal)
   signal classifyAutoChosen(bool enabled)
   signal classifyAllChosen(bool enabled)
+  signal companionEnabledChosen(bool enabled)
+  signal companionPairChosen()
 
   readonly property var colorFields: [
     { key: "severe", label: "Severe" },
@@ -27,6 +30,12 @@ Item {
 
   function colorOf(id) {
     return (colors && colors[id]) ? colors[id] : "#000000"
+  }
+
+  function pairingCode() {
+    var code = String((companion && companion.code) || "")
+    if (code.length === 6) return code.slice(0, 3) + " " + code.slice(3)
+    return code
   }
 
   function commitColor(id, hex) {
@@ -299,6 +308,152 @@ Item {
             color: theme.darkForeground
             font.family: theme.fontFamily
             font.pixelSize: theme.fontSize - 1
+          }
+        }
+
+        Column {
+          width: parent.width
+          spacing: 8
+          Text {
+            text: "iPhone sync"
+            color: theme.brightForeground
+            font.family: theme.fontFamily
+            font.pixelSize: theme.fontSize + 2
+            font.bold: true
+          }
+          Text {
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: "Listen on this network for the OHealth iPhone app. The phone must enter the pairing code, and the certificate it shows must match. Samples are saved for the person this window has open."
+            color: theme.foreground
+            font.family: theme.fontFamily
+            font.pixelSize: theme.fontSize
+          }
+          Row {
+            spacing: 10
+            Rectangle {
+              width: 22
+              height: 22
+              radius: 4
+              anchors.verticalCenter: parent.verticalCenter
+              color: root.companion && root.companion.enabled ? theme.accent : theme.darkerBackground
+              border.width: 1
+              border.color: root.companion && root.companion.enabled ? theme.accent : theme.lighterBackground
+              Text {
+                anchors.centerIn: parent
+                visible: root.companion && root.companion.enabled
+                text: "✓"
+                color: theme.darkerBackground
+                font.pixelSize: 14
+                font.bold: true
+              }
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.companionEnabledChosen(!(root.companion && root.companion.enabled))
+              }
+            }
+            Text {
+              width: body.width - 32
+              wrapMode: Text.Wrap
+              text: "Listen for an iPhone"
+              color: theme.brightForeground
+              font.family: theme.fontFamily
+              font.pixelSize: theme.fontSize
+              anchors.verticalCenter: parent.verticalCenter
+            }
+          }
+          Text {
+            visible: root.companion && root.companion.enabled
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: root.companion.error
+                  ? root.companion.error
+                  : (root.companion.listening ? "Visible on the network as " + (root.companion.name || "OHealth") + "." : "Starting the listener…")
+            color: root.companion && root.companion.error ? theme.red : theme.darkForeground
+            font.family: theme.fontFamily
+            font.pixelSize: theme.fontSize - 1
+          }
+          Column {
+            visible: root.companion && root.companion.enabled && !root.companion.paired && root.pairingCode().length > 0
+            width: parent.width
+            spacing: 4
+            Text {
+              text: "Pairing code"
+              color: theme.darkForeground
+              font.family: theme.fontFamily
+              font.pixelSize: theme.fontSize - 1
+            }
+            Text {
+              text: root.pairingCode()
+              color: theme.brightForeground
+              font.family: theme.fontFamily
+              font.pixelSize: 28
+              font.bold: true
+            }
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              text: "On the iPhone, choose this computer and enter the code."
+              color: theme.darkForeground
+              font.family: theme.fontFamily
+              font.pixelSize: theme.fontSize - 1
+            }
+          }
+          Column {
+            visible: root.companion && root.companion.enabled && root.companion.paired
+            width: parent.width
+            spacing: 8
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              text: "Paired with " + (root.companion.device || "an iPhone") + "."
+              color: theme.brightForeground
+              font.family: theme.fontFamily
+              font.pixelSize: theme.fontSize
+            }
+            Rectangle {
+              width: pairLabel.implicitWidth + 28
+              height: 34
+              radius: 6
+              color: pairArea.containsMouse ? theme.selection : theme.lighterBackground
+              border.width: 1
+              border.color: theme.muted
+              Text {
+                id: pairLabel
+                anchors.centerIn: parent
+                text: "Pair a different iPhone"
+                color: theme.brightForeground
+                font.family: theme.fontFamily
+                font.pixelSize: theme.fontSize
+              }
+              MouseArea {
+                id: pairArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.companionPairChosen()
+              }
+            }
+          }
+          Column {
+            visible: root.companion && root.companion.enabled && root.companion.fingerprint
+            width: parent.width
+            spacing: 4
+            Text {
+              text: "Certificate"
+              color: theme.darkForeground
+              font.family: theme.fontFamily
+              font.pixelSize: theme.fontSize - 1
+            }
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              text: root.companion.fingerprint || ""
+              color: theme.brightForeground
+              font.family: theme.fontFamily
+              font.pixelSize: theme.fontSize - 2
+            }
           }
         }
 

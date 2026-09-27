@@ -69,6 +69,14 @@ def status_path() -> Path:
     return cache_dir() / "status.json"
 
 
+def companion_dir() -> Path:
+    return config_dir() / "companion"
+
+
+def companion_status_path() -> Path:
+    return cache_dir() / "companion.json"
+
+
 def agent_file() -> Path:
     override = os.environ.get("OHEALTH_AGENT_FILE")
     if override:
