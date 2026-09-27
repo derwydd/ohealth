@@ -51,6 +51,7 @@ ShellRoot {
   property int rangeIndex: 1
   property bool customActive: false
   property int metricIndex: 0
+  property bool overview: true
   property int dayIndex: 0
   property int zoneIndex: 1
   property int zoneBeforeChat: 1
@@ -186,10 +187,26 @@ ShellRoot {
 
   function moveRange(delta) { setRange(rangeIndex + delta) }
 
+  function showOverview() {
+    overview = true
+    gallery = ""
+  }
+
+  function showMetric(index) {
+    classifyHold = false
+    metricIndex = index
+    overview = false
+    gallery = ""
+    classifySoon.restart()
+  }
+
   function moveMetric(delta) {
     var metrics = (view && view.metrics) ? view.metrics : []
     if (!metrics.length) return
-    metricIndex = Math.max(0, Math.min(metrics.length - 1, metricIndex + delta))
+    var at = (overview || gallery !== "") ? -1 : metricIndex
+    var next = Math.max(-1, Math.min(metrics.length - 1, at + delta))
+    if (next < 0) showOverview()
+    else showMetric(next)
   }
 
   function moveDay(delta) {
@@ -268,7 +285,8 @@ ShellRoot {
     if (zone === "ranges") setRange(end ? rangeIds.length - 1 : 0)
     else if (zone === "metrics") {
       var metrics = (view && view.metrics) ? view.metrics : []
-      metricIndex = end ? Math.max(0, metrics.length - 1) : 0
+      if (end && metrics.length) showMetric(metrics.length - 1)
+      else showOverview()
     } else if (zone === "days") {
       var days = (view && view.days) ? view.days : []
       dayIndex = end ? Math.max(0, days.length - 1) : 0
@@ -855,6 +873,7 @@ ShellRoot {
         return
       }
       root.sessionEntered = true
+      root.showOverview()
       indexFile.reload()
       statusFile.reload()
       filesView.reload()
@@ -1193,8 +1212,18 @@ ShellRoot {
         anchors.top: menuBar.bottom
         anchors.left: parent.left
         anchors.right: parent.right
-        height: 56
+        height: 72
         color: appTheme.darkBackground
+
+        Rectangle {
+          anchors.fill: parent
+          gradient: Gradient {
+            orientation: Gradient.Horizontal
+            GradientStop { position: 0.0; color: Qt.rgba(appTheme.accent.r, appTheme.accent.g, appTheme.accent.b, 0.14) }
+            GradientStop { position: 0.5; color: Qt.rgba(appTheme.magenta.r, appTheme.magenta.g, appTheme.magenta.b, 0.05) }
+            GradientStop { position: 1.0; color: "transparent" }
+          }
+        }
 
         Item {
           anchors.left: parent.left
@@ -1205,22 +1234,43 @@ ShellRoot {
           Row {
             id: titleRow
             spacing: 14
-            Text {
-              text: "OHealth"
-              color: appTheme.brightForeground
-              font.family: appTheme.fontFamily
-              font.pixelSize: 18
-              font.bold: true
+            Rectangle {
+              width: 42
+              height: 42
+              radius: 13
               anchors.verticalCenter: parent.verticalCenter
+              gradient: Gradient {
+                GradientStop { position: 0.0; color: appTheme.accent }
+                GradientStop { position: 1.0; color: appTheme.magenta }
+              }
+              Text {
+                anchors.centerIn: parent
+                text: root.sessionEntered && root.activePersonName().length > 0 ? root.activePersonName().charAt(0).toUpperCase() : "O"
+                color: appTheme.darkerBackground
+                font.family: appTheme.fontFamily
+                font.pixelSize: 20
+                font.bold: true
+              }
             }
-            Text {
-              visible: root.sessionEntered && root.activePersonName().length > 0
-              text: root.activePersonName()
-              color: appTheme.accent
-              font.family: appTheme.fontFamily
-              font.pixelSize: appTheme.fontSize
-              font.bold: true
+            Column {
               anchors.verticalCenter: parent.verticalCenter
+              spacing: 2
+              Text {
+                text: root.sessionEntered && root.activePersonName().length > 0 ? root.activePersonName() : "OHealth"
+                color: appTheme.brightForeground
+                font.family: appTheme.fontFamily
+                font.pixelSize: 22
+                font.bold: true
+              }
+              Text {
+                text: !root.sessionEntered ? "Choose a person to begin"
+                  : root.gallery === "xrays" ? "X-Rays"
+                  : root.gallery === "labs" ? "Blood and Urine Tests"
+                  : (root.view && root.view.label ? root.view.label + " · " : "") + "Health dashboard"
+                color: appTheme.darkForeground
+                font.family: appTheme.fontFamily
+                font.pixelSize: appTheme.fontSize - 2
+              }
             }
           }
           MouseArea {
@@ -1272,12 +1322,9 @@ ShellRoot {
         onCustomRangeChosen: (start, end) => root.saveCustomRange(start, end)
         severityColors: root.severityColors
         classifying: root.classifyBusy
-        onMetricChosen: index => {
-          root.classifyHold = false
-          root.metricIndex = index
-          root.gallery = ""
-          classifySoon.restart()
-        }
+        overview: root.overview
+        onOverviewChosen: root.showOverview()
+        onMetricChosen: index => root.showMetric(index)
         onDayChosen: index => root.dayIndex = index
         onZoneChosen: name => {
           for (var i = 0; i < root.zones.length; i++) if (root.zones[i] === name) root.zoneIndex = i

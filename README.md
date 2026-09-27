@@ -44,6 +44,10 @@ What that covers: steps, active energy, exercise minutes, walking and running di
 
 `ohealth --sample` does not read an export. The index is marked `labeledSample`.
 
+## Dashboard
+
+The header shows the name of the person the window has open. Click it to switch people. **Dashboard** in the left panel opens an overview of colored cards: the range at a glance, daily goals, the last seven days, heart and steps, sleep, vitals, agent flags, and records. The metrics and documents listed under **Dashboard** each open a page in the same card design. A metric page has a progress ring, a daily chart with its Y-axis, and cards for the low, average, high, and selected day.
+
 ## Theme
 
 Colors come from Omarchy's current theme file:

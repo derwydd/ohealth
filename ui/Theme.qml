@@ -23,6 +23,11 @@ QtObject {
   property color green: "#9ece6a"
   property color cyan: "#449dab"
   property color orange: "#eb927b"
+  property color blue: "#7aa2f7"
+  property color magenta: "#ad8ee6"
+  property color brightCyan: "#0db9d7"
+  property color brightGreen: "#b9f27c"
+  property color brightYellow: "#ff9e64"
 
   property string fontFamily: "CaskaydiaMono Nerd Font"
   property int fontSize: 13
@@ -44,6 +49,11 @@ QtObject {
     green = "#9ece6a"
     cyan = "#449dab"
     orange = "#eb927b"
+    blue = "#7aa2f7"
+    magenta = "#ad8ee6"
+    brightCyan = "#0db9d7"
+    brightGreen = "#b9f27c"
+    brightYellow = "#ff9e64"
     fontFamily = "CaskaydiaMono Nerd Font"
     fontSize = 13
     spaceScale = 1
@@ -82,6 +92,11 @@ QtObject {
     if (c.green) green = c.green
     if (c.cyan) cyan = c.cyan
     if (c.orange) orange = c.orange
+    blue = c.blue || c.accent || blue
+    if (c.magenta) magenta = c.magenta
+    if (c.bright_cyan) brightCyan = c.bright_cyan
+    if (c.bright_green) brightGreen = c.bright_green
+    if (c.bright_yellow) brightYellow = c.bright_yellow
   }
 
   function applyShell(raw) {

@@ -24,7 +24,7 @@ Item {
       ["drag across a chart", "save that span as this person's date range"],
       ["h  l  ←  →", "change the focused row"],
       ["j  k  ↑  ↓", "change the focused row"],
-      ["g  home", "first day or first metric"],
+      ["g  home", "first day or the dashboard"],
       ["G  end", "last day or last metric"],
       ["page up  page down", "move further in that region"],
       ["[", "shorter range"],

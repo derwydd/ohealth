@@ -31,7 +31,7 @@ Item {
 
   Rectangle {
     anchors.fill: parent
-    color: theme.background
+    color: "transparent"
 
     Column {
       anchors.fill: parent
