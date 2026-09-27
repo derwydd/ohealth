@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ohealth_paths import (  # noqa: E402
+    cache_dir,
     companion_dir,
     companion_status_path,
     ensure_layout,
@@ -257,35 +258,171 @@ def read_frame(stream) -> dict:
 
 def write_frame(stream, payload: dict) -> None:
     body = json.dumps(payload, separators=(",", ":")).encode()
-    stream.write(len(body).to_bytes(4, "big") + body)
-    stream.flush()
+    stream.sendall(len(body).to_bytes(4, "big") + body)
 
 
-def _advertise(port: int, fingerprint: str) -> subprocess.Popen | None:
-    binary = shutil.which("avahi-publish-service")
-    if binary is None:
+def _log(message: str) -> None:
+    path = cache_dir() / "companion.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n")
+    except OSError:
+        pass
+
+
+def _pid_path() -> Path:
+    return cache_dir() / "companion.pid"
+
+
+def _live_pid() -> int | None:
+    path = _pid_path()
+    if not path.is_file():
         return None
-    return subprocess.Popen(
-        [
-            binary, "-s", service_name(), SERVICE_TYPE, str(port),
-            "v=1", f"fp={fingerprint.replace(':', '')}",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
+    try:
+        pid = int(path.read_text().strip())
+    except ValueError:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def stop_serve() -> None:
+    pid = _live_pid()
+    _pid_path().unlink(missing_ok=True)
+    if pid is None or pid == os.getpid():
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    for _ in range(30):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def ensure_serve() -> None:
+    """Keep the listener up while Settings has iPhone sync on, even if the window closes."""
+    if os.environ.get("OHEALTH_COMPANION_NO_SERVE") == "1":
+        if _stored().get("companionEnabled") != "1":
+            stop_serve()
+        return
+    if _stored().get("companionEnabled") != "1":
+        stop_serve()
+        write_public(listening=False, port=0, error="")
+        return
+    if _live_pid() is not None:
+        return
+    log = cache_dir() / "companion.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    handle = log.open("a", encoding="utf-8")
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "serve"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=handle,
+        stderr=handle,
     )
 
 
+def _lan_ipv4() -> str | None:
+    """Address the iPhone can open. The machine's public IPv6 is not that path."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))
+        address = probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+    if not address or address.startswith("127."):
+        return None
+    return address
+
+
+def _pair_host() -> str:
+    host = socket.gethostname().split(".")[0].lower()
+    safe = "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in host).strip("-")[:24] or "computer"
+    return f"ohealth-{safe}.local"
+
+
+def _advertise(port: int, fingerprint: str) -> list[subprocess.Popen]:
+    service_bin = shutil.which("avahi-publish-service")
+    if service_bin is None:
+        return []
+    ip = _lan_ipv4()
+    host = _pair_host()
+    procs: list[subprocess.Popen] = []
+    address_bin = shutil.which("avahi-publish-address")
+    if address_bin and ip:
+        procs.append(subprocess.Popen(
+            [address_bin, "-R", host, ip],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        ))
+        time.sleep(0.3)
+    command = [service_bin, "-s"]
+    if ip:
+        command.extend(["-H", host])
+    command.extend([
+        service_name(), SERVICE_TYPE, str(port),
+        "v=1", f"fp={fingerprint.replace(':', '')}",
+    ])
+    procs.append(subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    ))
+    return procs
+
+
+def _open_server() -> socket.socket:
+    """Accept the address the iPhone picks. Bonjour often offers IPv6 first."""
+    try:
+        server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("::", PORT))
+        return server
+    except OSError:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server.bind(("0.0.0.0", PORT))
+        except OSError:
+            server.bind(("0.0.0.0", 0))
+        return server
+
+
 def _connection(ctx: ssl.SSLContext, client: socket.socket) -> None:
+    client.settimeout(60)
     tls = ctx.wrap_socket(client, server_side=True)
     try:
-        tls.settimeout(45)
+        peer = "?"
+        try:
+            peer = str(tls.getpeername()[0])
+        except OSError:
+            pass
+        _log(f"tls from {peer}")
         while True:
             try:
                 message = read_frame(tls)
             except (TimeoutError, ConnectionError, json.JSONDecodeError, ValueError):
                 break
             reply = handle_message(message)
+            _log(f"reply {reply.get('type')} to {peer}")
             write_frame(tls, reply)
             if reply.get("type") == "error":
                 break
@@ -304,28 +441,32 @@ def serve() -> int:
     except (RuntimeError, subprocess.CalledProcessError, OSError) as exc:
         write_public(listening=False, port=0, error=str(exc) or "Could not prepare the pairing certificate.")
         return 1
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        server.bind(("0.0.0.0", PORT))
-    except OSError:
-        server.bind(("0.0.0.0", 0))
+    _pid_path().write_text(str(os.getpid()))
+    os.chmod(_pid_path(), 0o600)
+    server = _open_server()
     server.listen(4)
     server.settimeout(1.0)
     port = int(server.getsockname()[1])
+    _log(f"listening on {server.family.name} port {port}")
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(cert, key)
-    publisher = _advertise(port, fingerprint)
+    publishers = _advertise(port, fingerprint)
     error = ""
-    if publisher is None:
+    if not publishers:
         error = "avahi-publish-service is not installed, so an iPhone cannot discover this computer."
     else:
-        time.sleep(0.3)
-        if publisher.poll() is not None:
-            err = (publisher.stderr.read() if publisher.stderr else "") or ""
+        time.sleep(0.4)
+        failed = [proc for proc in publishers if proc.poll() is not None]
+        if failed:
+            err = ""
+            if failed[-1].stderr:
+                err = failed[-1].stderr.read() or ""
             error = (err.strip().splitlines() or ["The network service could not be advertised."])[-1]
-            publisher = None
+            for proc in publishers:
+                if proc.poll() is None:
+                    proc.terminate()
+            publishers = []
     write_public(listening=True, port=port, error=error)
 
     def _stop(_signum, _frame) -> None:
@@ -335,28 +476,32 @@ def serve() -> int:
     try:
         while _stored().get("companionEnabled") == "1":
             try:
-                client, _addr = server.accept()
+                client, addr = server.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
+            _log(f"connection from {addr[0]}")
             try:
                 _connection(context, client)
-            except (ssl.SSLError, OSError, ConnectionError):
-                pass
+            except Exception as exc:  # noqa: BLE001 — one phone must not stop the listener
+                _log(f"connection closed: {exc.__class__.__name__}: {exc}")
             finally:
                 client.close()
     finally:
-        if publisher is not None and publisher.poll() is None:
-            publisher.terminate()
+        for proc in publishers:
+            if proc.poll() is None:
+                proc.terminate()
         server.close()
+        if _pid_path().is_file() and _pid_path().read_text().strip() == str(os.getpid()):
+            _pid_path().unlink(missing_ok=True)
         write_public(listening=False, port=0, error="")
     return 0
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pair and receive Health samples from the OHealth iPhone app")
-    parser.add_argument("command", choices=("status", "config", "serve"))
+    parser.add_argument("command", choices=("status", "config", "serve", "ensure"))
     args = parser.parse_args()
     try:
         ensure_layout()
@@ -368,6 +513,11 @@ def main() -> None:
             if not isinstance(patch, dict):
                 raise ValueError("Expected a JSON object.")
             payload = apply_companion_config(patch)
+            ensure_serve()
+            payload = write_public()
+        elif args.command == "ensure":
+            ensure_serve()
+            payload = write_public()
         else:
             payload = write_public()
     except Exception as exc:  # noqa: BLE001 — one error string for the window

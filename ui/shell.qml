@@ -20,7 +20,7 @@ ShellRoot {
     refreshAgents()
     if (sampleRequested) root.sampleOnNextEnter = true
     refreshPeople()
-    companionBoot.command = [companionScript, "status"]
+    companionBoot.command = [companionScript, "ensure"]
     companionBoot.running = true
   }
 
@@ -534,8 +534,6 @@ ShellRoot {
     listening: false,
     error: ""
   })
-  property bool companionStop: false
-  property bool companionApplyListen: false
   property bool classifyHold: false
   property bool classifyBusy: false
   property bool classifyCancel: false
@@ -619,24 +617,6 @@ ShellRoot {
 
   function applyCompanion(raw) {
     try { companion = JSON.parse(raw) } catch (e) { return }
-    if (!companionApplyListen) return
-    companionApplyListen = false
-    setCompanionListening(!!companion.enabled)
-  }
-
-  function setCompanionListening(on) {
-    if (on) {
-      companionStop = false
-      if (!companionServe.running) {
-        companionServe.command = [companionScript, "serve"]
-        companionServe.running = true
-      }
-      return
-    }
-    if (companionServe.running) {
-      companionStop = true
-      companionServe.running = false
-    }
   }
 
   function saveCompanion(patch) {
@@ -825,10 +805,7 @@ ShellRoot {
   Process {
     id: companionBoot
     running: false
-    onExited: {
-      root.companionApplyListen = true
-      companionFile.reload()
-    }
+    onExited: companionFile.reload()
   }
   Process {
     id: companionProc
@@ -839,20 +816,7 @@ ShellRoot {
     onStarted: write(payload + "\n")
     onExited: (exitCode) => {
       if (exitCode !== 0) toast.show(String(companionErr.text || "").trim() || "Could not update iPhone sync")
-      root.companionApplyListen = true
       companionFile.reload()
-    }
-  }
-  Process {
-    id: companionServe
-    running: false
-    stderr: StdioCollector { id: companionServeErr }
-    onExited: (exitCode) => {
-      var stopped = root.companionStop
-      root.companionStop = false
-      companionFile.reload()
-      if (!stopped && exitCode !== 0 && root.companion.enabled)
-        toast.show(String(companionServeErr.text || "").trim() || "iPhone sync stopped")
     }
   }
   Process {

@@ -829,6 +829,7 @@ def test_custom_range_is_saved_for_the_person(tmp: Path) -> None:
 
 def test_companion_pairs_and_stores_samples(tmp: Path) -> None:
     env = isolate(tmp)
+    env["OHEALTH_COMPANION_NO_SERVE"] = "1"
     enter_person(env, "Alex")
     assert run(env, "ohealth_sync.py", ["--sample", "--sample-end", "2026-09-25"]).returncode == 0
     enabled = run(env, "ohealth_companion.py", ["config"], stdin=json.dumps({"enabled": True}))
